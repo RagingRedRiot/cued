@@ -1,0 +1,252 @@
+//! The clap surface (DESIGN.md §6.1). CLI = linear happy-path; branching
+//! lives in TOML files (`cued submit`). Every command that takes a job
+//! accepts an id (`j7`) or a live job's name interchangeably (§2).
+
+use clap::{Args, Parser, Subcommand};
+
+#[derive(Debug, Parser)]
+#[command(name = "cued", version, about = "Durable one-off & recurring scheduling", long_about = None)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Serve exactly schedule/list/show/cancel/logs via MCP over stdio.
+    Mcp,
+    /// Review the stored definition and confirm approval (no noninteractive bypass).
+    Approve { job: String },
+    /// Schedule a one-off command: cued at "9am tomorrow" -- ./backup.sh
+    At {
+        /// When to run (§9 grammar: "9am tomorrow", "in 90m", "2026-06-25 09:00")
+        time: String,
+        /// The command. After `--`: argv, exec'd directly. As a single
+        /// quoted string (no `--`): run via `sh -c` (§2.2).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+        #[command(flatten)]
+        common: SubmitCommon,
+    },
+
+    /// Schedule a notification: cued remind "1h" "stretch"
+    Remind {
+        /// [WHEN] MESSAGE — when (§9 grammar; a bare duration means "that
+        /// far from now") and what. With --every, WHEN is optional and
+        /// anchors the cadence ("9am" --every "6h", §4.1).
+        #[arg(required = true, num_args = 1..=2, value_names = ["WHEN", "MESSAGE"])]
+        args: Vec<String>,
+        /// Make it recurring: --every "day 9am" or --every "30m" (§4)
+        #[arg(long)]
+        every: Option<String>,
+        #[command(flatten)]
+        common: SubmitCommon,
+    },
+
+    /// Schedule a recurring command: cued every "30m" -- ./sync.sh
+    Every {
+        /// Cadence (§9 grammar: "30m", "day 09:00", "month on 1 at 9am")
+        spec: String,
+        /// Anchor / first firing; with an interval spec this makes an
+        /// anchored Every ("every 6h starting 9am", §4.1).
+        #[arg(long)]
+        at: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+        #[command(flatten)]
+        common: SubmitCommon,
+    },
+
+    /// Schedule a linear chain: cued chain "./build.sh" --then "./test.sh"
+    Chain {
+        first: String,
+        /// On success, go to the next link (repeatable).
+        #[arg(long)]
+        then: Vec<String>,
+        /// Insert a durable wait before the next link: --then-after 1h CMD
+        #[arg(long, value_names = ["DURATION", "CMD"], num_args = 2)]
+        then_after: Vec<String>,
+        /// Uniform failure policy for the whole chain.
+        #[arg(long, value_parser = ["stop", "continue"], default_value = "stop")]
+        on_fail: String,
+        #[command(flatten)]
+        common: SubmitCommon,
+    },
+
+    /// Submit a TOML workflow file (§6.2)
+    Submit {
+        file: std::path::PathBuf,
+        /// Override / supply the schedule from the command line.
+        #[arg(long)]
+        at: Option<String>,
+        #[arg(long)]
+        every: Option<String>,
+        /// Read the file's times as belonging to this IANA zone instead of
+        /// the machine's; a `zone` key in the file does the same (§9).
+        #[arg(long, value_name = "IANA")]
+        zone: Option<String>,
+    },
+
+    /// What's pending (live jobs + recently ended runs; Held always shown)
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect a job; --toml round-trips the canonical graph (§6)
+    Show {
+        job: String,
+        #[arg(long)]
+        toml: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Cancel a job: stop re-arming and terminate any live run (§4.2)
+    Cancel { job: String },
+
+    /// Captured output of a job's runs (read straight from log files, §5.1)
+    Logs {
+        job: String,
+        /// A specific run (default: latest).
+        #[arg(long)]
+        run: Option<i64>,
+        #[arg(long)]
+        step: Option<String>,
+        #[arg(long)]
+        attempt: Option<u32>,
+        /// Follow the currently running attempt.
+        #[arg(short, long)]
+        follow: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Resume a Held run from where it parked (§3.4)
+    Continue { job: String },
+
+    /// Re-run a terminal or Held run, rewinding it in place (§3.4)
+    Retry {
+        job: String,
+        /// Restart from this step instead of the interrupted one.
+        #[arg(long)]
+        from: Option<String>,
+    },
+
+    /// Start nothing new for a job; a step already running finishes and is recorded (§4.2)
+    Pause { job: String },
+
+    /// Re-arm a paused job to its next future instant (never back-fills, §4.2)
+    Resume { job: String },
+
+    /// Prune terminal runs and their logs per the retention policy (§10.2)
+    Gc,
+
+    /// Install/inspect a persistence backend so the daemon survives
+    /// logout/reboot (§8). With no flags: probe this host and offer what it
+    /// actually supports.
+    Setup {
+        /// Install without prompting (§8.1's three-way).
+        #[arg(long, value_parser = ["systemd-linger", "systemd", "cron"])]
+        backend: Option<String>,
+        /// Report what's installed and what this host supports, then stop.
+        #[arg(long)]
+        status: bool,
+        /// Remove the installed backend (§8.2 symmetric teardown).
+        #[arg(long, conflicts_with_all = ["backend", "status"])]
+        uninstall: bool,
+    },
+
+    /// Run the daemon (what persistence backends invoke; auto-spawned by
+    /// the client when absent, §5.2)
+    Daemon(DaemonArgs),
+}
+
+/// Flags shared by the submitting front-ends.
+#[derive(Debug, Args)]
+pub struct SubmitCommon {
+    /// Human name for the job (unique among live jobs).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Retain an env var the secrets denylist would strip (§7.5).
+    #[arg(long = "keep-env", value_name = "VAR")]
+    pub keep_env: Vec<String>,
+    /// Read the times in this command as belonging to this IANA zone
+    /// instead of the machine's — "9am Eastern" while you live in Mountain
+    /// (§9). Output is still shown in your own zone.
+    #[arg(long, value_name = "IANA")]
+    pub zone: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonArgs {
+    /// Log to stderr instead of quietly to the journal/log file.
+    #[arg(long)]
+    pub foreground: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_at(args: &[&str]) -> Vec<String> {
+        match Cli::try_parse_from(args).expect("parse").command {
+            Command::At { command, .. } => command,
+            other => panic!("expected At, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn at_takes_argv_after_separator() {
+        // §2.2: after `--`, argv — including hyphenated flags.
+        assert_eq!(parse_at(&["cued", "at", "9am", "--", "./x", "--full"]), ["./x", "--full"]);
+    }
+
+    #[test]
+    fn at_takes_a_single_string_without_separator() {
+        // §2.2: single quoted string, no `--` → later desugared to sh -c.
+        assert_eq!(
+            parse_at(&["cued", "at", "9am", "make build && make deploy"]),
+            ["make build && make deploy"]
+        );
+    }
+
+    #[test]
+    fn remind_takes_when_message_or_just_message_with_every() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).expect("parse").command {
+            Command::Remind { args, every, .. } => (args, every),
+            other => panic!("expected Remind, got {other:?}"),
+        };
+        // cued remind "1h" "stretch"
+        let (args, every) = parse(&["cued", "remind", "1h", "stretch"]);
+        assert_eq!(args, ["1h", "stretch"]);
+        assert_eq!(every, None);
+        // cued remind --every "day 9am" "standup" — one positional (§6.1)
+        let (args, every) = parse(&["cued", "remind", "--every", "day 9am", "standup"]);
+        assert_eq!(args, ["standup"]);
+        assert_eq!(every.as_deref(), Some("day 9am"));
+        // cued remind "9am" "standup" --every "6h" — anchored cadence (§4.1)
+        let (args, every) = parse(&["cued", "remind", "9am", "standup", "--every", "6h"]);
+        assert_eq!(args, ["9am", "standup"]);
+        assert_eq!(every.as_deref(), Some("6h"));
+        // No positionals at all is a parse error.
+        assert!(Cli::try_parse_from(["cued", "remind", "--every", "6h"]).is_err());
+    }
+
+    #[test]
+    fn at_flags_precede_the_command() {
+        let (name, command) = match Cli::try_parse_from([
+            "cued", "at", "--name", "backup", "9am", "--", "./backup.sh",
+        ])
+        .expect("parse")
+        .command
+        {
+            Command::At { command, common, .. } => (common.name, command),
+            other => panic!("expected At, got {other:?}"),
+        };
+        assert_eq!(name.as_deref(), Some("backup"));
+        assert_eq!(command, ["./backup.sh"]);
+    }
+}
