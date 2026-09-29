@@ -18,7 +18,7 @@
 //! suspend — lands with `deadline`.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -163,9 +163,13 @@ impl Spawner for SystemSpawner {
         }
 
         // The log file exists before the process does, so `cued logs` has
-        // something to tail the moment the attempt starts. 0600 (§7.5).
+        // something to tail the moment the attempt starts. 0600 (§7.5), in
+        // job and run directories that are 0700 rather than the umask's.
         if let Some(dir) = request.log_file.parent() {
-            std::fs::create_dir_all(dir)
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
                 .with_context(|| format!("creating log dir {}", dir.display()))?;
         }
         let log = std::fs::OpenOptions::new()
@@ -434,6 +438,26 @@ mod tests {
         // §7.5: log file is 0600.
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&log)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    /// §7.4: the job and run directories a log creates are private too,
+    /// rather than whatever the umask leaves, so they don't depend on the
+    /// logs directory above them to keep job ids and step names to the user.
+    #[tokio::test]
+    async fn log_directories_are_private_whatever_the_umask() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let log = dir.path().join("j1/r1/step.1.log");
+        SystemSpawner
+            .run(request(&["/bin/true"], log.clone()))
+            .await?;
+        for created in ["j1", "j1/r1"] {
+            let mode = std::fs::metadata(dir.path().join(created))?
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "{created}");
+        }
         Ok(())
     }
 

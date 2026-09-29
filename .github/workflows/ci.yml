@@ -1,0 +1,101 @@
+name: CI
+
+# Build and test checks, defined by the pull request's own copy of this file.
+# That means a pull request can rewrite them; controls.yml is the check it
+# cannot, and it fails any pull request that touches this file.
+#
+# No path filters, deliberately: a filter that misses one path is a check that
+# silently stops running.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Read-only token, no secrets: these jobs build and run the pull request's code.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo test --locked
+
+  # DESIGN.md §7.1: protect one user's jobs from other local users. Two real
+  # UIDs in a container each take a turn as owner: the owner is served, and the
+  # other is refused by the filesystem and, with that barrier deliberately
+  # removed, by the daemon's kernel peer-credential check. See
+  # scripts/security/users.sh for the cases.
+  #
+  # Pinned to 24.04: the fixture image is Ubuntu 24.04, and the binary built
+  # here must match its glibc.
+  access-control:
+    name: cross-user access
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Default features only: this is the binary users install, without the
+      # test-hooks fault points.
+      - run: cargo build --locked
+      - run: scripts/security/run.sh target/debug/cued
+
+  # One stable name for branch protection to require. `if: always()` makes a
+  # skipped or cancelled job a failure here rather than a silent pass.
+  complete:
+    name: ci complete
+    needs: [fmt, clippy, test, access-control]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every CI job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for result in $RESULTS; do test "$result" = success; done

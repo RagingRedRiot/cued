@@ -1,0 +1,127 @@
+name: Controls
+
+# A check a pull request cannot rewrite.
+#
+# Every job in ci.yml is defined by the copy of the file *in the pull request*,
+# so a PR can edit it: replace the cross-user access test with `true`, or drop
+# it, and still go green. Required status checks match by name, not by content,
+# so that is enough.
+#
+# This workflow runs on `pull_request_target`, which uses the **base branch's**
+# copy of the file. A PR cannot change what runs here without first merging a
+# change to main, which this same check gates.
+#
+# It fails any PR that touches a control file unless someone with write access
+# has said they reviewed it by applying the `reviewed-controls` label, to the
+# revision now at the head of the PR:
+#
+#   - Only the labelling event counts, not the label's presence. Any later push
+#     or label change fails the check again; remove and re-apply the label
+#     after reading the new diff. (Found by relay; stethoscope-mcp decision 46.)
+#   - The labeller must have write access. Triage can apply labels too.
+#   - The labelled revision must still be the head. Re-running an old
+#     `labeled` run after a newer push replays the old event, and would
+#     otherwise approve a diff nobody read.
+#
+# SAFETY: `pull_request_target` runs with the base repository's token, so this
+# job must never check out or execute the PR's code. It does neither: it asks
+# the API which files changed and compares names. Keep it that way.
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  control-files:
+    name: control files reviewed
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fail if a control file changed without a fresh reviewed-controls label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
+          APPLIED_LABEL: ${{ github.event.label.name }}
+          LABELLER: ${{ github.event.sender.login }}
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # What decides whether "passing" means anything:
+          #   .github/            the workflows, this one included; without it
+          #                       one PR could disable this job for every PR
+          #                       after it
+          #   scripts/security/   the cross-user access fixture (DESIGN.md §7.1)
+          #   tests/              existing tests only: a new test file is always
+          #                       welcome, but editing, deleting or renaming one
+          #                       can weaken what CI proves
+          # Both sides of a rename are checked, so a control cannot be moved to
+          # an unlisted path and rewritten there.
+          is_control() {
+            local status="$1" file="$2" previous="$3"
+            case "$file" in .github/*|scripts/security/*) return 0 ;; esac
+            case "$previous" in .github/*|scripts/security/*|tests/*) return 0 ;; esac
+            case "$file" in
+              tests/*) [ "$status" != added ] && return 0 ;;
+            esac
+            return 1
+          }
+
+          # Assigned first, not read through `< <(...)`: set -e cannot see a
+          # failure inside a process substitution, so a failed API call would
+          # read as "no files changed" and pass.
+          files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
+            --jq '.[] | [.status, .filename, (.previous_filename // "")] | @tsv')
+
+          touched=()
+          while IFS=$'\t' read -r status file previous; do
+            [ -z "$file" ] && continue
+            if is_control "$status" "$file" "$previous"; then
+              touched+=("$status: ${previous:+$previous -> }$file")
+            fi
+          done <<< "$files"
+
+          if [ ${#touched[@]} -eq 0 ]; then
+            echo "No control file touched."
+            exit 0
+          fi
+
+          echo "This pull request changes control files:"
+          printf '  %s\n' "${touched[@]}"
+
+          if [ "$ACTION" = labeled ] && [ "$APPLIED_LABEL" = reviewed-controls ]; then
+            permission=$(gh api "repos/$REPO/collaborators/$LABELLER/permission" --jq .permission)
+            head=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+            if [ "$permission" != admin ] && [ "$permission" != write ]; then
+              echo
+              echo "reviewed-controls was applied by $LABELLER, who has '$permission' access; write access is required."
+            elif [ "$head" != "$EVENT_HEAD" ]; then
+              echo
+              echo "reviewed-controls was applied to $EVENT_HEAD, but the head is now $head."
+              echo "This is a re-run of an old approval. Remove and re-apply the label after reading the new diff."
+            else
+              echo
+              echo "reviewed-controls was just applied to $head by $LABELLER — allowed."
+              exit 0
+            fi
+            exit 1
+          fi
+
+          cat <<'EOF'
+
+          These files decide what CI checks and what "passing" means: the
+          workflows under .github/, the cross-user access fixture under
+          scripts/security/, and the existing tests under tests/.
+
+          Read the diff. If the change is intended, apply the `reviewed-controls`
+          label to this pull request and this check will pass. If the label is
+          already on, a push or label change since it was applied has reset
+          this check: remove it and apply it again after reading the new diff.
+          EOF
+          exit 1
