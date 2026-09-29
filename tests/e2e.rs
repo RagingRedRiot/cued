@@ -11,7 +11,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use cued::config::Config;
-use cued::model::{CapturedEnv, Hooks, JobSpec, JobStatus, MissedWait, Policies, RunStatus, Schedule};
+use cued::model::{
+    CapturedEnv, Hooks, JobSpec, JobStatus, MissedWait, Policies, RunStatus, Schedule,
+};
 use cued::paths::Paths;
 use cued::proto::{PROTO_VERSION, Request, RequestBody, Response};
 use cued::store::Store;
@@ -34,7 +36,10 @@ fn temp_paths(root: &Path) -> Result<Paths> {
 
 async fn roundtrip(socket: &Path, body: RequestBody) -> Result<Response> {
     let mut stream = UnixStream::connect(socket).await?;
-    let mut payload = serde_json::to_string(&Request { proto: PROTO_VERSION, body })?;
+    let mut payload = serde_json::to_string(&Request {
+        proto: PROTO_VERSION,
+        body,
+    })?;
     payload.push('\n');
     stream.write_all(payload.as_bytes()).await?;
     let mut line = String::new();
@@ -67,7 +72,12 @@ async fn one_off_submits_fires_and_lists() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let paths = temp_paths(dir.path())?;
     let store = Store::open(&paths.db_file).await?;
-    let daemon_task = tokio::spawn(daemon::serve_with(paths.clone(), Config::default(), store, NoBusNotifier));
+    let daemon_task = tokio::spawn(daemon::serve_with(
+        paths.clone(),
+        Config::default(),
+        store,
+        NoBusNotifier,
+    ));
     await_socket(&paths.socket_file).await?;
 
     // Ping: proto handshake works.
@@ -172,7 +182,12 @@ async fn crash_held_then_continue_completes() -> Result<()> {
         .expect("claimed the waiting cursor");
 
     // Daemon #2 starts: reconciliation must park the run, not re-run it.
-    let daemon_task = tokio::spawn(daemon::serve_with(paths.clone(), Config::default(), store.clone(), NoBusNotifier));
+    let daemon_task = tokio::spawn(daemon::serve_with(
+        paths.clone(),
+        Config::default(),
+        store.clone(),
+        NoBusNotifier,
+    ));
     await_socket(&paths.socket_file).await?;
 
     let mut held = false;
@@ -199,7 +214,14 @@ async fn crash_held_then_continue_completes() -> Result<()> {
     assert_eq!(notifications, 1, "on_hold notification enqueued");
 
     // The human decides: continue, addressed by name (§2).
-    match roundtrip(&paths.socket_file, RequestBody::Continue { job: "comeback".into() }).await? {
+    match roundtrip(
+        &paths.socket_file,
+        RequestBody::Continue {
+            job: "comeback".into(),
+        },
+    )
+    .await?
+    {
         Response::Rearmed { step, .. } => assert_eq!(step, "run"),
         other => bail!("expected Rearmed, got {other:?}"),
     }
@@ -226,7 +248,12 @@ async fn abandon_marks_overdue_run_missed() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let paths = temp_paths(dir.path())?;
     let store = Store::open(&paths.db_file).await?;
-    let daemon_task = tokio::spawn(daemon::serve_with(paths.clone(), Config::default(), store.clone(), NoBusNotifier));
+    let daemon_task = tokio::spawn(daemon::serve_with(
+        paths.clone(),
+        Config::default(),
+        store.clone(),
+        NoBusNotifier,
+    ));
     await_socket(&paths.socket_file).await?;
 
     let spec = Box::new(JobSpec {
@@ -279,7 +306,12 @@ async fn recurring_job_fires_repeatedly_and_pauses() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let paths = temp_paths(dir.path())?;
     let store = Store::open(&paths.db_file).await?;
-    let daemon_task = tokio::spawn(daemon::serve_with(paths.clone(), Config::default(), store.clone(), NoBusNotifier));
+    let daemon_task = tokio::spawn(daemon::serve_with(
+        paths.clone(),
+        Config::default(),
+        store.clone(),
+        NoBusNotifier,
+    ));
     await_socket(&paths.socket_file).await?;
 
     let out_file = dir.path().join("ticks.txt");
@@ -326,7 +358,14 @@ async fn recurring_job_fires_repeatedly_and_pauses() -> Result<()> {
     assert!(done >= 2, "wanted 2 completed firings, saw {done}");
 
     // Pause: firing stops even though targets keep coming due.
-    match roundtrip(&paths.socket_file, RequestBody::Pause { job: "ticker".into() }).await? {
+    match roundtrip(
+        &paths.socket_file,
+        RequestBody::Pause {
+            job: "ticker".into(),
+        },
+    )
+    .await?
+    {
         Response::Paused { job: paused } => assert_eq!(paused, job),
         other => bail!("expected Paused, got {other:?}"),
     }
@@ -340,7 +379,14 @@ async fn recurring_job_fires_repeatedly_and_pauses() -> Result<()> {
     );
 
     // Resume: re-armed to a future instant, firing continues.
-    match roundtrip(&paths.socket_file, RequestBody::Resume { job: "ticker".into() }).await? {
+    match roundtrip(
+        &paths.socket_file,
+        RequestBody::Resume {
+            job: "ticker".into(),
+        },
+    )
+    .await?
+    {
         Response::Resumed { next_at, .. } => assert!(next_at.is_some()),
         other => bail!("expected Resumed, got {other:?}"),
     }
@@ -402,7 +448,10 @@ async fn reminder_enqueues_without_a_bus_then_delivers() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(status, "done", "notify step succeeds on enqueue, busless or not");
+    assert_eq!(
+        status, "done",
+        "notify step succeeds on enqueue, busless or not"
+    );
     let pending = store.undelivered_notifications().await?;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].spec.title, "stretch");
@@ -429,7 +478,12 @@ async fn proto_mismatch_is_a_designed_reply() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let paths = temp_paths(dir.path())?;
     let store = Store::open(&paths.db_file).await?;
-    let daemon_task = tokio::spawn(daemon::serve_with(paths.clone(), Config::default(), store, NoBusNotifier));
+    let daemon_task = tokio::spawn(daemon::serve_with(
+        paths.clone(),
+        Config::default(),
+        store,
+        NoBusNotifier,
+    ));
     await_socket(&paths.socket_file).await?;
 
     let mut stream = UnixStream::connect(&paths.socket_file).await?;
@@ -515,7 +569,10 @@ async fn a_step_that_keeps_failing_internally_ends_up_held_not_lost() -> Result<
             break;
         }
     }
-    assert!(held, "the run should be parked in Held, not silently stranded");
+    assert!(
+        held,
+        "the run should be parked in Held, not silently stranded"
+    );
 
     let (run_status, reason): (String, Option<String>) =
         sqlx::query_as("SELECT status, held_reason FROM runs WHERE job_id = ? AND id = ?")
@@ -583,11 +640,10 @@ async fn cancel_kills_the_running_process_group_and_ends_the_job() -> Result<()>
     let mut running = false;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let kind: String =
-            sqlx::query_scalar("SELECT cursor_kind FROM runs WHERE job_id = ?")
-                .bind(job.0)
-                .fetch_one(store.pool())
-                .await?;
+        let kind: String = sqlx::query_scalar("SELECT cursor_kind FROM runs WHERE job_id = ?")
+            .bind(job.0)
+            .fetch_one(store.pool())
+            .await?;
         if kind == "running" {
             running = true;
             break;
@@ -597,11 +653,16 @@ async fn cancel_kills_the_running_process_group_and_ends_the_job() -> Result<()>
 
     let runs = match roundtrip(
         &paths.socket_file,
-        RequestBody::Cancel { job: job.to_string() },
+        RequestBody::Cancel {
+            job: job.to_string(),
+        },
     )
     .await?
     {
-        Response::JobCancelled { job: cancelled, runs } => {
+        Response::JobCancelled {
+            job: cancelled,
+            runs,
+        } => {
             assert_eq!(cancelled, job);
             runs
         }
@@ -689,7 +750,12 @@ async fn logs_manifest_points_at_files_the_client_can_read() -> Result<()> {
 
     let (run, attempts) = match roundtrip(
         &paths.socket_file,
-        RequestBody::Logs { job: job.to_string(), run: None, step: None, attempt: None },
+        RequestBody::Logs {
+            job: job.to_string(),
+            run: None,
+            step: None,
+            attempt: None,
+        },
     )
     .await?
     {
@@ -701,9 +767,16 @@ async fn logs_manifest_points_at_files_the_client_can_read() -> Result<()> {
     let entry = &attempts[0];
     assert_eq!(entry.step, "run");
     assert_eq!(entry.attempt, 1);
-    assert_eq!(entry.exit_code, Some(7), "the header's outcome comes from here");
+    assert_eq!(
+        entry.exit_code,
+        Some(7),
+        "the header's outcome comes from here"
+    );
     assert!(!entry.timed_out);
-    assert!(entry.ended_at.is_some(), "a finished attempt is not followable");
+    assert!(
+        entry.ended_at.is_some(),
+        "a finished attempt is not followable"
+    );
 
     // The client derives the path from the manifest; it must be the one the
     // daemon actually wrote, and §2.1's merged view holds both streams.
@@ -711,16 +784,27 @@ async fn logs_manifest_points_at_files_the_client_can_read() -> Result<()> {
     let captured = std::fs::read_to_string(&path)
         .with_context(|| format!("the manifest pointed at {}", path.display()))?;
     assert!(captured.contains("to-stdout"), "{captured:?}");
-    assert!(captured.contains("to-stderr"), "merged view is missing stderr: {captured:?}");
+    assert!(
+        captured.contains("to-stderr"),
+        "merged view is missing stderr: {captured:?}"
+    );
 
     // §7.5: captured output is as private as the store.
     use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(&path)?.permissions().mode() & 0o777,
+        0o600
+    );
 
     // §10.3: a run that doesn't exist is an error, not an empty answer.
     match roundtrip(
         &paths.socket_file,
-        RequestBody::Logs { job: job.to_string(), run: Some(99), step: None, attempt: None },
+        RequestBody::Logs {
+            job: job.to_string(),
+            run: Some(99),
+            step: None,
+            attempt: None,
+        },
     )
     .await?
     {
@@ -752,7 +836,10 @@ async fn a_deadline_kills_the_running_step_and_fails_the_run() -> Result<()> {
     // grandchild: the deadline must reach the whole process group, not just
     // the direct child (§2.2).
     let marker = dir.path().join("grandchild-ran");
-    let script = format!("echo started; (sleep 3; touch {}) & sleep 30", marker.display());
+    let script = format!(
+        "echo started; (sleep 3; touch {}) & sleep 30",
+        marker.display()
+    );
     let spec = Box::new(JobSpec {
         name: Some("budget".into()),
         schedule: Schedule::Once {
@@ -798,8 +885,15 @@ async fn a_deadline_kills_the_running_step_and_fails_the_run() -> Result<()> {
             .bind(job.0)
             .fetch_one(store.pool())
             .await?;
-    assert_eq!(status, "failed", "a blown deadline is a failure, not a cancel");
-    assert_eq!(reason.as_deref(), Some("deadline"), "the reason must be on record");
+    assert_eq!(
+        status, "failed",
+        "a blown deadline is a failure, not a cancel"
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("deadline"),
+        "the reason must be on record"
+    );
 
     // §2.2: the whole group went, grandchild included.
     tokio::time::sleep(Duration::from_millis(3500)).await;
@@ -900,7 +994,11 @@ async fn a_deadline_that_expires_during_a_wait_stops_the_next_step() -> Result<(
             .bind(job.0)
             .fetch_all(store.pool())
             .await?;
-    assert_eq!(attempts, ["step1"], "an attempt was recorded for a step that never ran");
+    assert_eq!(
+        attempts,
+        ["step1"],
+        "an attempt was recorded for a step that never ran"
+    );
 
     daemon_task.abort();
     Ok(())
@@ -1057,16 +1155,21 @@ async fn a_firing_that_keeps_failing_warns_instead_of_going_quiet() -> Result<()
             break;
         }
     }
-    assert!(warned, "the schedule went quiet with nothing to show for it");
+    assert!(
+        warned,
+        "the schedule went quiet with nothing to show for it"
+    );
 
-    let (title, body): (String, String) = sqlx::query_as(
-        "SELECT title, body FROM notifications WHERE job_id = ? AND run_id IS NULL",
-    )
-    .bind(job.0)
-    .fetch_one(store.pool())
-    .await?;
+    let (title, body): (String, String) =
+        sqlx::query_as("SELECT title, body FROM notifications WHERE job_id = ? AND run_id IS NULL")
+            .bind(job.0)
+            .fetch_one(store.pool())
+            .await?;
     assert!(title.contains("stopped firing"), "{title}");
-    assert!(body.contains("restart"), "the warning should say how to recover: {body}");
+    assert!(
+        body.contains("restart"),
+        "the warning should say how to recover: {body}"
+    );
 
     // §5.3: the schedule is still on record, so a restart re-arms it — the
     // store is the truth and the heap is derived.
@@ -1074,7 +1177,10 @@ async fn a_firing_that_keeps_failing_warns_instead_of_going_quiet() -> Result<()
         .bind(job.0)
         .fetch_one(store.pool())
         .await?;
-    assert!(next.is_some(), "the job must keep its schedule to be recoverable");
+    assert!(
+        next.is_some(),
+        "the job must keep its schedule to be recoverable"
+    );
 
     daemon_task.abort();
     Ok(())
@@ -1151,9 +1257,18 @@ async fn a_deadline_ending_a_run_still_releases_the_queued_firing() -> Result<()
             .fetch_one(store.pool())
             .await?;
     assert!(queued.is_none(), "the slot should be empty once drained");
-    assert!(next.is_none(), "the budget was two firings — nothing more is coming");
+    assert!(
+        next.is_none(),
+        "the budget was two firings — nothing more is coming"
+    );
 
-    roundtrip(&paths.socket_file, RequestBody::Cancel { job: job.to_string() }).await?;
+    roundtrip(
+        &paths.socket_file,
+        RequestBody::Cancel {
+            job: job.to_string(),
+        },
+    )
+    .await?;
     daemon_task.abort();
     Ok(())
 }
@@ -1195,7 +1310,10 @@ async fn a_burst_of_simultaneous_one_offs_all_run() -> Result<()> {
             other => bail!("expected Submitted, got {other:?}"),
         }
     }
-    assert!(Timestamp::now() < at, "submitting took too long to make a burst");
+    assert!(
+        Timestamp::now() < at,
+        "submitting took too long to make a burst"
+    );
 
     let mut done = 0;
     for _ in 0..120 {
@@ -1210,8 +1328,14 @@ async fn a_burst_of_simultaneous_one_offs_all_run() -> Result<()> {
     let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE status = 'held'")
         .fetch_one(store.pool())
         .await?;
-    assert_eq!(held, 0, "a burst should queue for the writer, not end up Held");
-    assert_eq!(done, BURST, "every job in the burst should have run to completion");
+    assert_eq!(
+        held, 0,
+        "a burst should queue for the writer, not end up Held"
+    );
+    assert_eq!(
+        done, BURST,
+        "every job in the burst should have run to completion"
+    );
 
     daemon_task.abort();
     Ok(())
@@ -1237,7 +1361,9 @@ async fn claimed_sleeper(
 ) -> Result<(cued::model::JobId, cued::model::RunId)> {
     let spec = Box::new(JobSpec {
         name: Some("sleeper".into()),
-        schedule: Schedule::Once { at: Timestamp::now() },
+        schedule: Schedule::Once {
+            at: Timestamp::now(),
+        },
         graph: submit::single_shell_graph(vec!["/bin/sleep".into(), "1".into()]),
         cwd: "/".into(),
         env: CapturedEnv::default(),
@@ -1249,12 +1375,11 @@ async fn claimed_sleeper(
         other => bail!("expected Submitted, got {other:?}"),
     };
     for _ in 0..200 {
-        let claimed: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM runs WHERE job_id = ? AND cursor_kind = 'running'",
-        )
-        .bind(job.0)
-        .fetch_optional(store.pool())
-        .await?;
+        let claimed: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM runs WHERE job_id = ? AND cursor_kind = 'running'")
+                .bind(job.0)
+                .fetch_optional(store.pool())
+                .await?;
         if let Some(run) = claimed {
             return Ok((job, cued::model::RunId(run)));
         }
@@ -1311,8 +1436,14 @@ async fn a_close_that_fails_briefly_still_lands() -> Result<()> {
         .await?;
 
     let (cursor, status) = poll_cursor(&store, job, run, "done").await?;
-    assert_eq!(cursor, "done", "the close never landed; the run is stranded");
-    assert_eq!(status, "done", "the step succeeded and the run should say so");
+    assert_eq!(
+        cursor, "done",
+        "the close never landed; the run is stranded"
+    );
+    assert_eq!(
+        status, "done",
+        "the step succeeded and the run should say so"
+    );
 
     daemon_task.abort();
     Ok(())
@@ -1337,7 +1468,10 @@ async fn a_close_that_keeps_failing_parks_the_run() -> Result<()> {
     break_step_close(&store).await?;
 
     let (cursor, status) = poll_cursor(&store, job, run, "held").await?;
-    assert_eq!(cursor, "held", "a close that never lands should park the run");
+    assert_eq!(
+        cursor, "held",
+        "a close that never lands should park the run"
+    );
     assert_eq!(status, "held");
     let reason: Option<String> =
         sqlx::query_scalar("SELECT held_reason FROM runs WHERE job_id = ? AND id = ?")
@@ -1371,12 +1505,17 @@ async fn pause_lets_the_running_step_finish_and_holds_the_next() -> Result<()> {
     let ran = dir.path().join("second-step-ran");
     let graph = submit::chain_graph(
         "sleep 1",
-        &[submit::Link::ThenAfter("1s".into(), format!("touch {}", ran.display()))],
+        &[submit::Link::ThenAfter(
+            "1s".into(),
+            format!("touch {}", ran.display()),
+        )],
         submit::ChainFailure::Stop,
     )?;
     let spec = Box::new(JobSpec {
         name: Some("paused-workflow".into()),
-        schedule: Schedule::Once { at: Timestamp::now() },
+        schedule: Schedule::Once {
+            at: Timestamp::now(),
+        },
         graph,
         cwd: "/".into(),
         env: CapturedEnv::default(),
@@ -1404,7 +1543,14 @@ async fn pause_lets_the_running_step_finish_and_holds_the_next() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     assert_eq!(cursor().await?.0, "running", "the first step never started");
-    match roundtrip(&paths.socket_file, RequestBody::Pause { job: job.to_string() }).await? {
+    match roundtrip(
+        &paths.socket_file,
+        RequestBody::Pause {
+            job: job.to_string(),
+        },
+    )
+    .await?
+    {
         Response::Paused { .. } => {}
         other => bail!("expected Paused, got {other:?}"),
     }
@@ -1417,11 +1563,28 @@ async fn pause_lets_the_running_step_finish_and_holds_the_next() -> Result<()> {
     .bind(job.0)
     .fetch_one(store.pool())
     .await?;
-    assert_eq!(closed, 1, "the step running at pause must finish and be recorded");
-    assert_eq!(cursor().await?.0, "waiting", "the run should sit on its next step");
-    assert!(!ran.exists(), "the next step started while the job was paused");
+    assert_eq!(
+        closed, 1,
+        "the step running at pause must finish and be recorded"
+    );
+    assert_eq!(
+        cursor().await?.0,
+        "waiting",
+        "the run should sit on its next step"
+    );
+    assert!(
+        !ran.exists(),
+        "the next step started while the job was paused"
+    );
 
-    match roundtrip(&paths.socket_file, RequestBody::Resume { job: job.to_string() }).await? {
+    match roundtrip(
+        &paths.socket_file,
+        RequestBody::Resume {
+            job: job.to_string(),
+        },
+    )
+    .await?
+    {
         Response::Resumed { .. } => {}
         other => bail!("expected Resumed, got {other:?}"),
     }
@@ -1457,16 +1620,24 @@ async fn resume_does_not_count_paused_time_as_missed() -> Result<()> {
     let ran = dir.path().join("second-step-ran");
     let graph = submit::chain_graph(
         "true",
-        &[submit::Link::ThenAfter("1h".into(), format!("touch {}", ran.display()))],
+        &[submit::Link::ThenAfter(
+            "1h".into(),
+            format!("touch {}", ran.display()),
+        )],
         submit::ChainFailure::Stop,
     )?;
     let spec = Box::new(JobSpec {
         name: Some("long-pause".into()),
-        schedule: Schedule::Once { at: Timestamp::now() },
+        schedule: Schedule::Once {
+            at: Timestamp::now(),
+        },
         graph,
         cwd: "/".into(),
         env: CapturedEnv::default(),
-        policies: Policies { missed_wait: MissedWait::Abandon, ..Policies::default() },
+        policies: Policies {
+            missed_wait: MissedWait::Abandon,
+            ..Policies::default()
+        },
         hooks: Hooks::default(),
     });
     let job = match roundtrip(&paths.socket_file, RequestBody::Submit { spec }).await? {
@@ -1499,9 +1670,19 @@ async fn resume_does_not_count_paused_time_as_missed() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     assert_eq!(first_closed().await?, 1, "the first step never closed");
-    assert_eq!(cursor().await?.0, "waiting", "the run never reached its 1h wait");
+    assert_eq!(
+        cursor().await?.0,
+        "waiting",
+        "the run never reached its 1h wait"
+    );
 
-    roundtrip(&paths.socket_file, RequestBody::Pause { job: job.to_string() }).await?;
+    roundtrip(
+        &paths.socket_file,
+        RequestBody::Pause {
+            job: job.to_string(),
+        },
+    )
+    .await?;
     // What a long pause leaves behind: the wait came due five minutes ago —
     // well past the missed grace — while the job sat paused.
     let due = Timestamp::now().checked_sub(SignedDuration::from_mins(5))?;
@@ -1511,7 +1692,13 @@ async fn resume_does_not_count_paused_time_as_missed() -> Result<()> {
         .execute(store.pool())
         .await?;
 
-    roundtrip(&paths.socket_file, RequestBody::Resume { job: job.to_string() }).await?;
+    roundtrip(
+        &paths.socket_file,
+        RequestBody::Resume {
+            job: job.to_string(),
+        },
+    )
+    .await?;
     for _ in 0..100 {
         if cursor().await?.0 == "done" {
             break;

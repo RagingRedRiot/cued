@@ -92,8 +92,8 @@ impl Paths {
             config_file,
         };
 
-        create_private_dir(&paths.data_dir)?;
-        create_private_dir(&paths.logs_dir)?;
+        secure_private_dir(&paths.data_dir, uid)?;
+        secure_private_dir(&paths.logs_dir, uid)?;
         if let Some(socket_dir) = paths.socket_file.parent() {
             create_private_dir(socket_dir)?;
             let metadata = std::fs::symlink_metadata(socket_dir)
@@ -176,6 +176,36 @@ fn create_private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", dir.display()))
 }
 
+/// A store or logs directory (§7.4): create it private, and hold one that
+/// already existed to the same standard. `create` leaves an existing
+/// directory's mode alone, so one made by something else — a restored
+/// backup, a dotfile manager, an older tool — would otherwise keep whatever
+/// it had. A symlink is followed: relocating the data directory is a
+/// reasonable thing to do, and what matters is who owns where it lands.
+///
+/// Another user's directory is refused, never adopted. One of ours that is
+/// open to group or world is tightened: we own it, so we can, and every file
+/// cued writes inside it assumes the directory keeps others out.
+fn secure_private_dir(dir: &Path, uid: u32) -> Result<()> {
+    create_private_dir(dir)?;
+    let metadata = std::fs::metadata(dir).with_context(|| format!("checking {}", dir.display()))?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.uid() == uid,
+        "{} must be a directory owned by uid {uid}",
+        dir.display()
+    );
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting permissions on {}", dir.display()))?;
+        eprintln!(
+            "cued: {} was mode {mode:o}; restricted it to 700",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +246,39 @@ mod tests {
             assert!(!name.contains('/'), "{name:?}");
             assert!(!name.contains(".."), "{name:?}");
         }
+    }
+
+    /// §7.4: a store directory that already existed open to others is
+    /// tightened, not trusted — `create` alone never touches an existing
+    /// directory's mode. One cued creates is private from the start.
+    #[test]
+    fn existing_store_directories_are_made_private() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let uid = unsafe { libc::getuid() };
+
+        let loose = root.path().join("loose");
+        std::fs::create_dir(&loose)?;
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755))?;
+        secure_private_dir(&loose, uid)?;
+        assert_eq!(
+            std::fs::metadata(&loose)?.permissions().mode() & 0o777,
+            0o700
+        );
+
+        let fresh = root.path().join("a/b/fresh");
+        secure_private_dir(&fresh, uid)?;
+        assert_eq!(
+            std::fs::metadata(&fresh)?.permissions().mode() & 0o777,
+            0o700
+        );
+
+        // Ownership is compared, not assumed: another uid's directory is refused.
+        let error = secure_private_dir(&loose, uid.wrapping_add(1)).unwrap_err();
+        assert!(
+            error.to_string().contains("must be a directory owned by"),
+            "{error}"
+        );
+        Ok(())
     }
 
     /// Ordinary ids — the ones every front-end generates — must come

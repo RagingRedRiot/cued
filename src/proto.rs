@@ -5,7 +5,9 @@
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Approval, JobSource, ExpiryReason, Job, JobId, JobSpec, JobStatus, RunId, RunStatus, StepId};
+use crate::model::{
+    Approval, ExpiryReason, Job, JobId, JobSource, JobSpec, JobStatus, RunId, RunStatus, StepId,
+};
 
 /// Bumped on incompatible changes; the daemon rejects mismatches with
 /// `Response::ProtoMismatch` so the CLI can print the fix (§5.1).
@@ -36,9 +38,16 @@ pub enum RequestBody {
     /// assigns the id. Boxed: a graph dwarfs every other request.
     Submit { spec: Box<JobSpec> },
     /// Separate verb: stale daemons must reject rather than ignore a gate.
-    SubmitDefinition { spec: Box<JobSpec>, source: JobSource, require_approval: bool },
+    SubmitDefinition {
+        spec: Box<JobSpec>,
+        source: JobSource,
+        require_approval: bool,
+    },
     /// Hash of the exact definition reviewed before interactive confirmation.
-    Approve { job: String, definition_hash: [u8; 32] },
+    Approve {
+        job: String,
+        definition_hash: [u8; 32],
+    },
     /// The §10.3 view. Default scope: live jobs + runs ended in the last
     /// 24h (Held always shown); `all` = everything retained.
     List { all: bool },
@@ -71,20 +80,42 @@ pub enum RequestBody {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "result")]
 pub enum Response {
-    Pong { proto: u32 },
+    Pong {
+        proto: u32,
+    },
     /// `run` is None for a recurring job — its runs are created firing by
     /// firing (§4.2).
-    Submitted { job: JobId, run: Option<RunId>, pending_approval: bool },
-    Approved { job: JobId },
-    JobList { jobs: Vec<JobEntry> },
+    Submitted {
+        job: JobId,
+        run: Option<RunId>,
+        pending_approval: bool,
+    },
+    Approved {
+        job: JobId,
+    },
+    JobList {
+        jobs: Vec<JobEntry>,
+    },
     /// continue/retry accepted: the run is back on the heap at this step.
-    Rearmed { job: JobId, run: RunId, step: String },
-    Paused { job: JobId },
+    Rearmed {
+        job: JobId,
+        run: RunId,
+        step: String,
+    },
+    Paused {
+        job: JobId,
+    },
     /// `next_at` is None when nothing remains to fire (exhausted schedule,
     /// or a one-off whose timing lives on its run).
-    Resumed { job: JobId, next_at: Option<Timestamp> },
+    Resumed {
+        job: JobId,
+        next_at: Option<Timestamp>,
+    },
     /// §10.2: what the sweep removed.
-    Collected { runs: u32, jobs: u32 },
+    Collected {
+        runs: u32,
+        jobs: u32,
+    },
     /// One job's whole definition (§6). The graph, schedule, env and
     /// policies are already one document in the store (§5.3), so this is
     /// that document plus the two scheduling columns that live beside it.
@@ -104,11 +135,18 @@ pub enum Response {
     /// The job is cancelled; `runs` are the runs that were live and have
     /// been marked `Cancelled` (their processes, if any, are being torn
     /// down per §2.2 — the reply doesn't wait out `kill_grace`).
-    JobCancelled { job: JobId, runs: Vec<RunId> },
+    JobCancelled {
+        job: JobId,
+        runs: Vec<RunId>,
+    },
     /// "daemon (proto X) is older/newer than this CLI (proto Y) — run
     /// stop the running `cued daemon` and rerun" (§5.1).
-    ProtoMismatch { daemon_proto: u32 },
-    Error { message: String },
+    ProtoMismatch {
+        daemon_proto: u32,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// One `cued list` row: the job, when it next fires (or was scheduled for),

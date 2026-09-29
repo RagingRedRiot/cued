@@ -21,11 +21,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 
-use crate::model::{
-    Approval, ApprovalState, JobSource, ExpiryReason, CatchUp, DeliveryReceipt, Graph, HeldReason, Hooks, Job, JobId, JobSpec, JobStatus, NotifySpec, Policies,
-    RunId, RunStatus, Schedule, StepId,
-};
 use crate::config::Retention;
+use crate::model::{
+    Approval, ApprovalState, CatchUp, DeliveryReceipt, ExpiryReason, Graph, HeldReason, Hooks, Job,
+    JobId, JobSource, JobSpec, JobStatus, NotifySpec, Policies, RunId, RunStatus, Schedule, StepId,
+};
 use crate::proto::LogAttempt;
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -289,19 +289,33 @@ impl Store {
         spec: &JobSpec,
         now: &Timestamp,
     ) -> Result<(JobId, Option<RunId>, Timestamp)> {
-        self.submit_definition(spec, now, JobSource::Cli, false).await
+        self.submit_definition(spec, now, JobSource::Cli, false)
+            .await
     }
 
     pub async fn submit_definition(
-        &self, spec: &JobSpec, now: &Timestamp, source: JobSource, require_approval: bool,
+        &self,
+        spec: &JobSpec,
+        now: &Timestamp,
+        source: JobSource,
+        require_approval: bool,
     ) -> Result<(JobId, Option<RunId>, Timestamp)> {
         crate::submit::validate(spec)?;
         if require_approval && let Schedule::Once { at } = spec.schedule {
-            ensure!(*now < at, "approval deadline has passed — reschedule the job");
+            ensure!(
+                *now < at,
+                "approval deadline has passed — reschedule the job"
+            );
         }
-        let approval = require_approval.then(|| -> Result<Approval> { Ok(Approval {
-            state: ApprovalState::Pending, definition_hash: spec.definition_hash()?, approved_at: None,
-        }) }).transpose()?;
+        let approval = require_approval
+            .then(|| -> Result<Approval> {
+                Ok(Approval {
+                    state: ApprovalState::Pending,
+                    definition_hash: spec.definition_hash()?,
+                    approved_at: None,
+                })
+            })
+            .transpose()?;
         let first_fire = match &spec.schedule {
             Schedule::Once { at } => *at,
             recurring => crate::schedule::next_fire(recurring, now)?
@@ -315,7 +329,8 @@ impl Store {
 
         // §4.2: recurring cadence lives on the job (re-armed at fire time);
         // a one-off's single instant lives on its run's cursor instead.
-        let next_fire_at = (spec.schedule.is_recurring() || require_approval).then(|| to_ts(&first_fire));
+        let next_fire_at =
+            (spec.schedule.is_recurring() || require_approval).then(|| to_ts(&first_fire));
 
         let mut tx = self.writer.begin().await?;
         // A pending job past its deadline has already expired and released its
@@ -387,7 +402,9 @@ impl Store {
 
     pub async fn load_job(&self, id: JobId) -> Result<Job> {
         let row = sqlx::query("SELECT * FROM jobs WHERE id = ?")
-            .bind(id.0).fetch_optional(&self.reader).await?
+            .bind(id.0)
+            .fetch_optional(&self.reader)
+            .await?
             .with_context(|| format!("no such job {id}"))?;
         decode_job(&row)
     }
@@ -404,25 +421,36 @@ impl Store {
     /// example, catch_up=skip with an `until` that elapsed during approval).
     /// Paused jobs retain their lifecycle; pending definitions cannot end here.
     pub async fn finish_exhausted_jobs(&self) -> Result<()> {
-        sqlx::query("UPDATE jobs SET status = 'done'
+        sqlx::query(
+            "UPDATE jobs SET status = 'done'
             WHERE status = 'active' AND next_fire_at IS NULL AND queued_at IS NULL
             AND (approval IS NULL OR json_extract(approval, '$.state') = 'approved')
-            AND NOT EXISTS (SELECT 1 FROM runs WHERE job_id = jobs.id AND cursor_kind != 'done')")
-            .execute(&self.writer).await?;
+            AND NOT EXISTS (SELECT 1 FROM runs WHERE job_id = jobs.id AND cursor_kind != 'done')",
+        )
+        .execute(&self.writer)
+        .await?;
         Ok(())
     }
 
     /// Compare the exact reviewed definition inside the transaction; a late
     /// approval also durably expires the job before returning the rejection.
-    pub async fn approve(&self, id: JobId, reviewed: [u8; 32], now: &Timestamp)
-        -> Result<(Option<RunId>, Option<Timestamp>)> {
+    pub async fn approve(
+        &self,
+        id: JobId,
+        reviewed: [u8; 32],
+        now: &Timestamp,
+    ) -> Result<(Option<RunId>, Option<Timestamp>)> {
         self.approve_with_clock(id, reviewed, || *now).await
     }
 
     /// Read the daemon's clock after acquiring the writer, so time waiting in
     /// the write queue cannot extend the authorization window.
-    pub async fn approve_with_clock(&self, id: JobId, reviewed: [u8; 32], clock: impl FnOnce() -> Timestamp)
-        -> Result<(Option<RunId>, Option<Timestamp>)> {
+    pub async fn approve_with_clock(
+        &self,
+        id: JobId,
+        reviewed: [u8; 32],
+        clock: impl FnOnce() -> Timestamp,
+    ) -> Result<(Option<RunId>, Option<Timestamp>)> {
         let mut tx = self.writer.begin().await?;
         let now = &clock();
         let job = load_job_in(&mut tx, id).await?;
@@ -431,19 +459,36 @@ impl Store {
             bail!("job {id} expired — reschedule it");
         }
         ensure!(job.status.is_live(), "job {id} has ended — reschedule it");
-        let approval = job.approval.as_ref().context("job does not require approval")?;
-        ensure!(approval.state == ApprovalState::Pending, "job is already approved");
+        let approval = job
+            .approval
+            .as_ref()
+            .context("job does not require approval")?;
+        ensure!(
+            approval.state == ApprovalState::Pending,
+            "job is already approved"
+        );
         let hash = job.definition().definition_hash()?;
-        ensure!(hash == reviewed, "definition changed since review — run `cued approve {id}` again");
-        let approval = Approval { state: ApprovalState::Approved, definition_hash: hash, approved_at: Some(*now) };
+        ensure!(
+            hash == reviewed,
+            "definition changed since review — run `cued approve {id}` again"
+        );
+        let approval = Approval {
+            state: ApprovalState::Approved,
+            definition_hash: hash,
+            approved_at: Some(*now),
+        };
         let mut run = None;
         let next = match &job.schedule {
             Schedule::Once { at } => {
-                let existing: Option<i64> = sqlx::query_scalar("SELECT id FROM runs WHERE job_id = ? ORDER BY id DESC LIMIT 1")
-                    .bind(id.0).fetch_optional(&mut *tx).await?;
+                let existing: Option<i64> = sqlx::query_scalar(
+                    "SELECT id FROM runs WHERE job_id = ? ORDER BY id DESC LIMIT 1",
+                )
+                .bind(id.0)
+                .fetch_optional(&mut *tx)
+                .await?;
                 let id_run = RunId(existing.unwrap_or(1));
                 if existing.is_none() {
-                sqlx::query("INSERT INTO runs (job_id, id, scheduled_for, status, cursor_kind, cursor_step, cursor_at) VALUES (?, ?, ?, 'pending', 'waiting', ?, ?)")
+                    sqlx::query("INSERT INTO runs (job_id, id, scheduled_for, status, cursor_kind, cursor_step, cursor_at) VALUES (?, ?, ?, 'pending', 'waiting', ?, ?)")
                     .bind(id.0).bind(id_run.0).bind(to_ts(at)).bind(&job.graph.entry).bind(to_ts(at))
                     .execute(&mut *tx).await?;
                 }
@@ -451,12 +496,17 @@ impl Store {
                 Some(*at)
             }
             schedule => {
-                let first: Option<String> = sqlx::query_scalar("SELECT next_fire_at FROM jobs WHERE id = ?")
-                    .bind(id.0).fetch_one(&mut *tx).await?;
+                let first: Option<String> =
+                    sqlx::query_scalar("SELECT next_fire_at FROM jobs WHERE id = ?")
+                        .bind(id.0)
+                        .fetch_one(&mut *tx)
+                        .await?;
                 let first = first.as_deref().map(from_ts).transpose()?;
                 match first {
                     Some(first) if first <= *now => match job.policies.catch_up {
-                        CatchUp::RunOnce => Some(crate::schedule::due_instants(schedule, &first, now, None)?.0),
+                        CatchUp::RunOnce => {
+                            Some(crate::schedule::due_instants(schedule, &first, now, None)?.0)
+                        }
                         CatchUp::Skip => crate::schedule::next_fire(schedule, now)?,
                     },
                     first => first,
@@ -465,8 +515,14 @@ impl Store {
         };
         sqlx::query("UPDATE jobs SET approval = ?, next_fire_at = ? WHERE id = ?")
             .bind(serde_json::to_string(&approval)?)
-            .bind(if run.is_some() { None } else { next.as_ref().map(to_ts) })
-            .bind(id.0).execute(&mut *tx).await?;
+            .bind(if run.is_some() {
+                None
+            } else {
+                next.as_ref().map(to_ts)
+            })
+            .bind(id.0)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok((run, next))
     }
@@ -508,12 +564,18 @@ impl Store {
     }
 
     pub async fn begin_step_checked(
-        &self, job: JobId, run: RunId, step: &str, now: &Timestamp,
+        &self,
+        job: JobId,
+        run: RunId,
+        step: &str,
+        now: &Timestamp,
         expected_approval: Option<[u8; 32]>,
     ) -> Result<Option<u32>> {
         let mut tx = self.writer.begin().await?;
         let definition = load_job_in(&mut tx, job).await?;
-        if !definition.can_start() || !matches_review(&definition, expected_approval) { return Ok(None); }
+        if !definition.can_start() || !matches_review(&definition, expected_approval) {
+            return Ok(None);
+        }
         let attempt: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(attempt), 0) + 1 FROM step_runs
              WHERE job_id = ? AND run_id = ? AND step_id = ?",
@@ -582,7 +644,11 @@ impl Store {
         self.finish_step_checked(close, None).await
     }
 
-    pub async fn finish_step_checked(&self, close: StepClose<'_>, expected_approval: Option<[u8; 32]>) -> Result<StepClosed> {
+    pub async fn finish_step_checked(
+        &self,
+        close: StepClose<'_>,
+        expected_approval: Option<[u8; 32]>,
+    ) -> Result<StepClosed> {
         let mut tx = self.writer.begin().await?;
 
         sqlx::query(
@@ -603,7 +669,10 @@ impl Store {
         let definition = load_job_in(&mut tx, close.job).await?;
         if !definition.approval_valid() || !matches_review(&definition, expected_approval) {
             tx.commit().await?;
-            return Ok(StepClosed { advanced: false, drained: None });
+            return Ok(StepClosed {
+                advanced: false,
+                drained: None,
+            });
         }
         let advanced = match &close.next {
             NextCursor::Waiting { step, at } => {
@@ -653,7 +722,10 @@ impl Store {
         if !advanced {
             // The step row is closed; the run is somebody else's now.
             tx.commit().await.context("committing finish_step")?;
-            return Ok(StepClosed { advanced: false, drained: None });
+            return Ok(StepClosed {
+                advanced: false,
+                drained: None,
+            });
         }
 
         // A run that just ended frees the §4.2 queue, and that release
@@ -681,7 +753,10 @@ impl Store {
         }
 
         tx.commit().await.context("committing finish_step")?;
-        Ok(StepClosed { advanced: true, drained })
+        Ok(StepClosed {
+            advanced: true,
+            drained,
+        })
     }
 
     /// Is this claim still the live one — i.e. is the cursor the
@@ -698,16 +773,17 @@ impl Store {
     /// Ownership, not just the step name: if this check had to be retried,
     /// the cursor it finds may be a newer attempt's (`Claim`), and spawning
     /// against that would put two processes on one step.
-    pub async fn claim_is_current(
+    pub async fn claim_is_current(&self, job: JobId, run: RunId, claim: Claim<'_>) -> Result<bool> {
+        self.claim_is_current_checked(job, run, claim, None).await
+    }
+
+    pub async fn claim_is_current_checked(
         &self,
         job: JobId,
         run: RunId,
         claim: Claim<'_>,
+        expected_approval: Option<[u8; 32]>,
     ) -> Result<bool> {
-        self.claim_is_current_checked(job, run, claim, None).await
-    }
-
-    pub async fn claim_is_current_checked(&self, job: JobId, run: RunId, claim: Claim<'_>, expected_approval: Option<[u8; 32]>) -> Result<bool> {
         let definition = self.load_job(job).await?;
         // Ownership and approval only, not `can_start`. The job was Active
         // when `begin_step` claimed this attempt; a `cued pause` landing
@@ -717,7 +793,9 @@ impl Store {
         // `false` here leaves it there with no process and nothing left to
         // close it. `cued cancel` needs no status check: it moves the cursor,
         // which `OWNS_CURSOR` sees.
-        if !definition.approval_valid() || !matches_review(&definition, expected_approval) { return Ok(false); }
+        if !definition.approval_valid() || !matches_review(&definition, expected_approval) {
+            return Ok(false);
+        }
         let owned: Option<i64> = sqlx::query_scalar(&format!(
             "SELECT 1 FROM runs WHERE job_id = ? AND id = ? {OWNS_CURSOR}"
         ))
@@ -800,14 +878,19 @@ impl Store {
     /// Runs whose cursor still says `Running` — found at startup, that means
     /// the step's process was killed with the daemon (§3.4 Case 2).
     pub async fn interrupted_runs(&self) -> Result<Vec<(JobId, RunId, StepId)>> {
-        let rows = sqlx::query(
-            "SELECT job_id, id, cursor_step FROM runs WHERE cursor_kind = 'running'",
-        )
-        .fetch_all(&self.reader)
-        .await?;
+        let rows =
+            sqlx::query("SELECT job_id, id, cursor_step FROM runs WHERE cursor_kind = 'running'")
+                .fetch_all(&self.reader)
+                .await?;
         Ok(rows
             .into_iter()
-            .map(|row| (JobId(row.get("job_id")), RunId(row.get("id")), row.get("cursor_step")))
+            .map(|row| {
+                (
+                    JobId(row.get("job_id")),
+                    RunId(row.get("id")),
+                    row.get("cursor_step"),
+                )
+            })
             .collect())
     }
 
@@ -847,11 +930,11 @@ impl Store {
              WHERE job_id = ? AND id = ? {guard}"
         );
         let mut query = sqlx::query(&sql)
-        .bind(run_status_text(RunStatus::Held))
-        .bind(step)
-        .bind(held_reason_text(reason))
-        .bind(job.0)
-        .bind(run.0);
+            .bind(run_status_text(RunStatus::Held))
+            .bind(step)
+            .bind(held_reason_text(reason))
+            .bind(job.0)
+            .bind(run.0);
         if let Some(claim) = claim {
             query = query
                 .bind(claim.step)
@@ -967,10 +1050,10 @@ impl Store {
              WHERE job_id = ? AND id = ? {guard}"
         );
         let mut query = sqlx::query(&sql)
-        .bind(run_status_text(RunStatus::Failed))
-        .bind(to_ts(now))
-        .bind(job.0)
-        .bind(run.0);
+            .bind(run_status_text(RunStatus::Failed))
+            .bind(to_ts(now))
+            .bind(job.0)
+            .bind(run.0);
         if let Some(claim) = claim {
             query = query
                 .bind(claim.step)
@@ -1036,7 +1119,10 @@ impl Store {
         at: &Timestamp,
     ) -> Result<()> {
         let mut tx = self.writer.begin().await?;
-        ensure!(load_job_in(&mut tx, job).await?.approval_valid(), "Pending approval — cannot rearm");
+        ensure!(
+            load_job_in(&mut tx, job).await?.approval_valid(),
+            "Pending approval — cannot rearm"
+        );
         sqlx::query(
             "UPDATE runs SET status = ?, cursor_kind = 'waiting', cursor_step = ?, cursor_at = ?
              WHERE job_id = ? AND id = ?",
@@ -1056,15 +1142,17 @@ impl Store {
     /// Returns the step to re-arm. No epoch bump — continuing is not a reset.
     pub async fn resume_held(&self, job: JobId, run: RunId, at: &Timestamp) -> Result<StepId> {
         let mut tx = self.writer.begin().await?;
-        ensure!(load_job_in(&mut tx, job).await?.approval_valid(), "Pending approval — approve the stored definition first");
-        let row = sqlx::query(
-            "SELECT cursor_kind, cursor_step FROM runs WHERE job_id = ? AND id = ?",
-        )
-        .bind(job.0)
-        .bind(run.0)
-        .fetch_optional(&mut *tx)
-        .await?
-        .with_context(|| format!("no such run {job}.{run}"))?;
+        ensure!(
+            load_job_in(&mut tx, job).await?.approval_valid(),
+            "Pending approval — approve the stored definition first"
+        );
+        let row =
+            sqlx::query("SELECT cursor_kind, cursor_step FROM runs WHERE job_id = ? AND id = ?")
+                .bind(job.0)
+                .bind(run.0)
+                .fetch_optional(&mut *tx)
+                .await?
+                .with_context(|| format!("no such run {job}.{run}"))?;
         let kind: String = row.get("cursor_kind");
         ensure!(
             kind == "held",
@@ -1090,18 +1178,26 @@ impl Store {
     /// run id, cursor back to `step`, runnable now. The epoch bump is what
     /// resets max_visits/Backoff counting while attempts keep appending. A
     /// finished one-shot's job comes back to Active for the duration.
-    pub async fn rewind_run(&self, job: JobId, run: RunId, step: &str, at: &Timestamp) -> Result<()> {
+    pub async fn rewind_run(
+        &self,
+        job: JobId,
+        run: RunId,
+        step: &str,
+        at: &Timestamp,
+    ) -> Result<()> {
         let mut tx = self.writer.begin().await?;
         let definition = load_job_in(&mut tx, job).await?;
-        ensure!(definition.status != JobStatus::Expired && definition.approval_valid(), "Pending approval or expired — cannot retry");
-        let kind: String = sqlx::query_scalar(
-            "SELECT cursor_kind FROM runs WHERE job_id = ? AND id = ?",
-        )
-        .bind(job.0)
-        .bind(run.0)
-        .fetch_optional(&mut *tx)
-        .await?
-        .with_context(|| format!("no such run {job}.{run}"))?;
+        ensure!(
+            definition.status != JobStatus::Expired && definition.approval_valid(),
+            "Pending approval or expired — cannot retry"
+        );
+        let kind: String =
+            sqlx::query_scalar("SELECT cursor_kind FROM runs WHERE job_id = ? AND id = ?")
+                .bind(job.0)
+                .bind(run.0)
+                .fetch_optional(&mut *tx)
+                .await?
+                .with_context(|| format!("no such run {job}.{run}"))?;
         ensure!(
             kind == "held" || kind == "done",
             "{job}.{run} is still live — `retry` re-runs terminal or held runs"
@@ -1163,10 +1259,7 @@ impl Store {
     ///
     /// `Missed` stays eligible: that is one abandoned run, and "run it
     /// anyway" is a coherent thing to ask for.
-    pub async fn latest_run_cursor(
-        &self,
-        job: JobId,
-    ) -> Result<(RunId, String, Option<StepId>)> {
+    pub async fn latest_run_cursor(&self, job: JobId) -> Result<(RunId, String, Option<StepId>)> {
         let row = sqlx::query(
             "SELECT id, cursor_kind, cursor_step FROM runs
              WHERE job_id = ? AND status != 'skipped'
@@ -1176,7 +1269,11 @@ impl Store {
         .fetch_optional(&self.reader)
         .await?
         .with_context(|| format!("job {job} has no run to act on"))?;
-        Ok((RunId(row.get("id")), row.get("cursor_kind"), row.get("cursor_step")))
+        Ok((
+            RunId(row.get("id")),
+            row.get("cursor_kind"),
+            row.get("cursor_step"),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -1254,10 +1351,16 @@ impl Store {
         self.record_firing_checked(firing, None).await
     }
 
-    pub async fn record_firing_checked(&self, firing: Firing<'_>, expected_approval: Option<[u8; 32]>) -> Result<Fired> {
+    pub async fn record_firing_checked(
+        &self,
+        firing: Firing<'_>,
+        expected_approval: Option<[u8; 32]>,
+    ) -> Result<Fired> {
         let mut tx = self.writer.begin().await?;
         let definition = load_job_in(&mut tx, firing.job).await?;
-        if !definition.can_start() || !matches_review(&definition, expected_approval) { return Ok(Fired::Superseded); }
+        if !definition.can_start() || !matches_review(&definition, expected_approval) {
+            return Ok(Fired::Superseded);
+        }
 
         // The claim, before anything is written. `status = 'active'` covers
         // a pause (which leaves `next_fire_at` alone); the instant match
@@ -1335,7 +1438,10 @@ impl Store {
         finish_job_if_exhausted(&mut tx, firing.job).await?;
 
         tx.commit().await.context("committing firing")?;
-        Ok(Fired::Recorded { run: created, drained })
+        Ok(Fired::Recorded {
+            run: created,
+            drained,
+        })
     }
 
     /// Enqueue a notification outside any particular run (§3.5) — for the
@@ -1373,13 +1479,14 @@ impl Store {
         job: JobId,
         entry_step: &str,
     ) -> Result<Option<(RunId, Timestamp)>> {
-        if !load_job_in(tx, job).await?.can_start() { return Ok(None); }
-        let queued: Option<String> =
-            sqlx::query_scalar("SELECT queued_at FROM jobs WHERE id = ?")
-                .bind(job.0)
-                .fetch_optional(&mut **tx)
-                .await?
-                .flatten();
+        if !load_job_in(tx, job).await?.can_start() {
+            return Ok(None);
+        }
+        let queued: Option<String> = sqlx::query_scalar("SELECT queued_at FROM jobs WHERE id = ?")
+            .bind(job.0)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
         let Some(at_text) = queued else {
             return Ok(None);
         };
@@ -1393,12 +1500,11 @@ impl Store {
             // §4.2: a Held run blocks the queue indefinitely — deliberately.
             return Ok(None);
         }
-        let paused: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM jobs WHERE id = ? AND status = 'paused'",
-        )
-        .bind(job.0)
-        .fetch_one(&mut **tx)
-        .await?;
+        let paused: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE id = ? AND status = 'paused'")
+                .bind(job.0)
+                .fetch_one(&mut **tx)
+                .await?;
         if paused > 0 {
             return Ok(None);
         }
@@ -1538,7 +1644,11 @@ impl Store {
 
     /// Expiry is evaluated at mutation time, after acquiring the database writer.
     /// Waiting behind GC must not let cancellation overwrite an elapsed expiry.
-    pub async fn cancel_job_with_clock(&self, job: JobId, clock: impl FnOnce() -> Timestamp) -> Result<Vec<RunId>> {
+    pub async fn cancel_job_with_clock(
+        &self,
+        job: JobId,
+        clock: impl FnOnce() -> Timestamp,
+    ) -> Result<Vec<RunId>> {
         let mut tx = self.writer.begin_with("BEGIN IMMEDIATE").await?;
         let now = &clock();
         // Expiry at `now >= deadline` wins over a cancel sharing the writer;
@@ -1546,7 +1656,10 @@ impl Store {
         let definition = load_job_in(&mut tx, job).await?;
         if expire_in(&mut tx, &definition, now).await? {
             tx.commit().await?;
-            bail!("job {job} already ended (it's {:?}) — nothing to cancel", JobStatus::Expired);
+            bail!(
+                "job {job} already ended (it's {:?}) — nothing to cancel",
+                JobStatus::Expired
+            );
         }
         let status = job_status(&job_status_row(&mut tx, job).await?)?;
         ensure!(
@@ -1602,7 +1715,10 @@ impl Store {
         now: &Timestamp,
     ) -> Result<()> {
         let mut tx = self.writer.begin().await?;
-        ensure!(load_job_in(&mut tx, job).await?.approval_valid(), "Pending approval — approve before resuming");
+        ensure!(
+            load_job_in(&mut tx, job).await?.approval_valid(),
+            "Pending approval — approve before resuming"
+        );
         let status = job_status(&job_status_row(&mut tx, job).await?)?;
         ensure!(
             status == JobStatus::Paused,
@@ -1612,14 +1728,12 @@ impl Store {
         // fired before the pause, so keeping it would make `resume` run a
         // past occurrence — "resume never back-fills" (§4.2) has to mean the
         // queue as well as the schedule.
-        sqlx::query(
-            "UPDATE jobs SET status = ?, next_fire_at = ?, queued_at = NULL WHERE id = ?",
-        )
-        .bind(job_status_text(JobStatus::Active))
-        .bind(next_fire_at.map(to_ts))
-        .bind(job.0)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("UPDATE jobs SET status = ?, next_fire_at = ?, queued_at = NULL WHERE id = ?")
+            .bind(job_status_text(JobStatus::Active))
+            .bind(next_fire_at.map(to_ts))
+            .bind(job.0)
+            .execute(&mut *tx)
+            .await?;
 
         // Compared as instants, not as the stored text.
         // The redundant `!= 'done'` lets the planner use `runs_live`
@@ -1849,7 +1963,12 @@ impl Store {
         let mut doomed = Vec::new();
         for (job, expired_at) in orphans {
             // An expiry stays visible for the retention window (§7.6).
-            if expired_at.as_deref().map(from_ts).transpose()?.is_some_and(|at| at > *cutoff) {
+            if expired_at
+                .as_deref()
+                .map(from_ts)
+                .transpose()?
+                .is_some_and(|at| at > *cutoff)
+            {
                 continue;
             }
             sqlx::query("DELETE FROM notifications WHERE job_id = ?")
@@ -1870,7 +1989,10 @@ impl Store {
     /// §6 `cued show`: the stored definition plus the two scheduling
     /// columns that aren't part of it — `next_fire_at` and the §4.2 queue
     /// slot both live on the row rather than in the document (§5.3).
-    pub async fn job_detail(&self, id: JobId) -> Result<(Job, Option<Timestamp>, Option<Timestamp>)> {
+    pub async fn job_detail(
+        &self,
+        id: JobId,
+    ) -> Result<(Job, Option<Timestamp>, Option<Timestamp>)> {
         let job = self.load_job(id).await?;
         let row = sqlx::query("SELECT next_fire_at, queued_at FROM jobs WHERE id = ?")
             .bind(id.0)
@@ -2023,12 +2145,17 @@ impl Store {
 
             let recent_or_held = last_run.as_ref().is_some_and(|run| {
                 run.status == RunStatus::Held
-                    || run.ended_at.as_ref().is_some_and(|ended| {
-                        now.duration_since(*ended).as_secs() < 24 * 3600
-                    })
+                    || run
+                        .ended_at
+                        .as_ref()
+                        .is_some_and(|ended| now.duration_since(*ended).as_secs() < 24 * 3600)
             });
-            let expired_at = row.get::<Option<&str>, _>("expired_at").map(from_ts).transpose()?;
-            let recently_expired = expired_at.is_some_and(|at| now.duration_since(at).as_secs() < 24 * 3600);
+            let expired_at = row
+                .get::<Option<&str>, _>("expired_at")
+                .map(from_ts)
+                .transpose()?;
+            let recently_expired =
+                expired_at.is_some_and(|at| now.duration_since(at).as_secs() < 24 * 3600);
             if !(all || status.is_live() || recent_or_held || recently_expired) {
                 continue;
             }
@@ -2037,10 +2164,16 @@ impl Store {
                 id: JobId(row.get("job_id")),
                 name: row.get("name"),
                 status,
-                approval: row.get::<Option<&str>, _>("approval").map(serde_json::from_str).transpose()?,
+                approval: row
+                    .get::<Option<&str>, _>("approval")
+                    .map(serde_json::from_str)
+                    .transpose()?,
                 source: parse_source(row.get("source"))?,
                 expired_at,
-                expiry_reason: row.get::<Option<&str>, _>("expiry_reason").map(serde_json::from_str).transpose()?,
+                expiry_reason: row
+                    .get::<Option<&str>, _>("expiry_reason")
+                    .map(serde_json::from_str)
+                    .transpose()?,
                 graph: serde_json::from_str(row.get("graph")).context("bad stored graph")?,
                 next_fire_at: row
                     .get::<Option<&str>, _>("next_fire_at")
@@ -2060,34 +2193,66 @@ impl Store {
 /// A valid new approval must not authorize an old in-memory definition that
 /// a scheduler task loaded before the definition changed and was reviewed again.
 fn matches_review(job: &Job, expected: Option<[u8; 32]>) -> bool {
-    expected.is_none_or(|hash| job.approval.as_ref().is_some_and(|a| a.definition_hash == hash))
+    expected.is_none_or(|hash| {
+        job.approval
+            .as_ref()
+            .is_some_and(|a| a.definition_hash == hash)
+    })
 }
 
 fn source_text(source: JobSource) -> &'static str {
-    match source { JobSource::Cli => "cli", JobSource::Mcp => "mcp" }
+    match source {
+        JobSource::Cli => "cli",
+        JobSource::Mcp => "mcp",
+    }
 }
 fn parse_source(text: &str) -> Result<JobSource> {
-    match text { "cli" => Ok(JobSource::Cli), "mcp" => Ok(JobSource::Mcp), _ => bail!("bad stored source") }
+    match text {
+        "cli" => Ok(JobSource::Cli),
+        "mcp" => Ok(JobSource::Mcp),
+        _ => bail!("bad stored source"),
+    }
 }
 fn decode_job(row: &sqlx::sqlite::SqliteRow) -> Result<Job> {
     let policies: PoliciesDoc = serde_json::from_str(row.get("policies"))?;
     Ok(Job {
-        id: JobId(row.get("id")), name: row.get("name"), status: job_status(row.get("status"))?,
-        schedule: serde_json::from_str(row.get("schedule"))?, graph: serde_json::from_str(row.get("graph"))?,
-        cwd: row.get("cwd"), env: serde_json::from_str(row.get("env"))?,
-        policies: policies.policies, hooks: policies.hooks, created_at: from_ts(row.get("created_at"))?,
-        approval: row.get::<Option<&str>, _>("approval").map(serde_json::from_str).transpose()?,
+        id: JobId(row.get("id")),
+        name: row.get("name"),
+        status: job_status(row.get("status"))?,
+        schedule: serde_json::from_str(row.get("schedule"))?,
+        graph: serde_json::from_str(row.get("graph"))?,
+        cwd: row.get("cwd"),
+        env: serde_json::from_str(row.get("env"))?,
+        policies: policies.policies,
+        hooks: policies.hooks,
+        created_at: from_ts(row.get("created_at"))?,
+        approval: row
+            .get::<Option<&str>, _>("approval")
+            .map(serde_json::from_str)
+            .transpose()?,
         source: parse_source(row.get("source"))?,
-        expired_at: row.get::<Option<&str>, _>("expired_at").map(from_ts).transpose()?,
-        expiry_reason: row.get::<Option<&str>, _>("expiry_reason").map(serde_json::from_str).transpose()?,
+        expired_at: row
+            .get::<Option<&str>, _>("expired_at")
+            .map(from_ts)
+            .transpose()?,
+        expiry_reason: row
+            .get::<Option<&str>, _>("expiry_reason")
+            .map(serde_json::from_str)
+            .transpose()?,
     })
 }
 async fn load_job_in(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, id: JobId) -> Result<Job> {
-    let row = sqlx::query("SELECT * FROM jobs WHERE id = ?").bind(id.0)
-        .fetch_optional(&mut **tx).await?.with_context(|| format!("no such job {id}"))?;
+    let row = sqlx::query("SELECT * FROM jobs WHERE id = ?")
+        .bind(id.0)
+        .fetch_optional(&mut **tx)
+        .await?
+        .with_context(|| format!("no such job {id}"))?;
     decode_job(&row)
 }
-async fn expire_all_in(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, now: &Timestamp) -> Result<()> {
+async fn expire_all_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    now: &Timestamp,
+) -> Result<()> {
     let rows = sqlx::query("SELECT * FROM jobs WHERE json_extract(approval, '$.state') = 'pending' AND status IN ('active', 'paused')")
         .fetch_all(&mut **tx).await?;
     for row in rows {
@@ -2095,10 +2260,23 @@ async fn expire_all_in(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, now: &Times
     }
     Ok(())
 }
-async fn expire_in(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, job: &Job, now: &Timestamp) -> Result<bool> {
-    if !job.status.is_live() || job.approval.as_ref().is_none_or(|a| a.state != ApprovalState::Pending) { return Ok(false); }
+async fn expire_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    job: &Job,
+    now: &Timestamp,
+) -> Result<bool> {
+    if !job.status.is_live()
+        || job
+            .approval
+            .as_ref()
+            .is_none_or(|a| a.state != ApprovalState::Pending)
+    {
+        return Ok(false);
+    }
     let (deadline, reason) = job.approval_deadline()?;
-    if *now < deadline { return Ok(false); }
+    if *now < deadline {
+        return Ok(false);
+    }
     sqlx::query("UPDATE jobs SET status = 'expired', next_fire_at = NULL, queued_at = NULL, expired_at = ?, expiry_reason = ? WHERE id = ?")
         .bind(to_ts(&deadline)).bind(serde_json::to_string(&reason)?).bind(job.id.0).execute(&mut **tx).await?;
     Ok(true)
@@ -2112,11 +2290,15 @@ async fn count_boundary<'e, E: sqlx::SqliteExecutor<'e>>(
     job: i64,
     keep: i64,
 ) -> Result<Option<i64>> {
-    Ok(sqlx::query_scalar("SELECT id FROM runs WHERE job_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?")
+    Ok(
+        sqlx::query_scalar(
+            "SELECT id FROM runs WHERE job_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?",
+        )
         .bind(job)
         .bind(keep)
         .fetch_optional(executor)
-        .await?)
+        .await?,
+    )
 }
 
 /// Delete runs GC chose in this same transaction, children first — foreign
@@ -2163,10 +2345,7 @@ async fn delete_runs_in(
 /// the one-off paths that insert their single run as `r1` directly. Taking
 /// the larger of the two means GC pruning the newest rows can't rewind the
 /// sequence (§10.2), however many of them it prunes.
-async fn next_run_id(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    job: JobId,
-) -> Result<i64> {
+async fn next_run_id(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, job: JobId) -> Result<i64> {
     sqlx::query_scalar(
         "UPDATE jobs
          SET run_seq = MAX(run_seq, (SELECT COALESCE(MAX(id), 0) FROM runs WHERE job_id = ?1)) + 1
@@ -2338,14 +2517,16 @@ mod tests {
         let store = Store::open(&db).await?;
 
         // The schema exists and is queryable.
-        let tables: Vec<(String,)> = sqlx::query_as(
-            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
-        )
-        .fetch_all(store.pool())
-        .await?;
+        let tables: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .fetch_all(store.pool())
+                .await?;
         let names: Vec<&str> = tables.iter().map(|(n,)| n.as_str()).collect();
         for expected in ["jobs", "runs", "step_runs", "notifications"] {
-            assert!(names.contains(&expected), "missing table {expected}: {names:?}");
+            assert!(
+                names.contains(&expected),
+                "missing table {expected}: {names:?}"
+            );
         }
 
         // §7.5: the DB file itself is 0600.
@@ -2361,7 +2542,9 @@ mod tests {
         let now = Timestamp::now();
         let at = now.checked_add(jiff::SignedDuration::from_secs(3600))?;
 
-        let (job, run, stored_at) = store.submit_job(&one_shot_spec(Some("t"), at), &now).await?;
+        let (job, run, stored_at) = store
+            .submit_job(&one_shot_spec(Some("t"), at), &now)
+            .await?;
         let run = run.expect("one-off creates its run at submit");
         assert_eq!(stored_at, at);
 
@@ -2377,7 +2560,10 @@ mod tests {
         assert_eq!(loaded.status, JobStatus::Active);
 
         // §3.3 step 1: intent persisted → no longer waiting.
-        let attempt = store.begin_step(job, run, "run", &now).await?.expect("claimed");
+        let attempt = store
+            .begin_step(job, run, "run", &now)
+            .await?
+            .expect("claimed");
         assert_eq!(attempt, 1);
         assert!(store.waiting_runs().await?.is_empty());
         // The CAS guard: a duplicate heap entry can't double-claim.
@@ -2419,7 +2605,9 @@ mod tests {
         let now = Timestamp::now();
         let at = now.checked_add(jiff::SignedDuration::from_secs(3600))?;
 
-        store.submit_job(&one_shot_spec(Some("dup"), at), &now).await?;
+        store
+            .submit_job(&one_shot_spec(Some("dup"), at), &now)
+            .await?;
         let err = store
             .submit_job(&one_shot_spec(Some("dup"), at), &now)
             .await

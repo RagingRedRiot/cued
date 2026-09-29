@@ -97,7 +97,10 @@ async fn fire_cycle(store: &Store, job: JobId, now: &Timestamp) -> Result<u128> 
     let Fired::Recorded { run: Some(run), .. } = fired else {
         anyhow::bail!("firing not recorded: {fired:?}");
     };
-    let attempt = store.begin_step(job, run, "run", now).await?.expect("claim");
+    let attempt = store
+        .begin_step(job, run, "run", now)
+        .await?
+        .expect("claim");
     store
         .finish_step(StepClose {
             job,
@@ -109,7 +112,10 @@ async fn fire_cycle(store: &Store, job: JobId, now: &Timestamp) -> Result<u128> 
             exit_code: Some(0),
             timed_out: false,
             outcome_edge: None,
-            next: NextCursor::Terminal { status: RunStatus::Done, fail_reason: None },
+            next: NextCursor::Terminal {
+                status: RunStatus::Done,
+                fail_reason: None,
+            },
             notifications: Vec::new(),
         })
         .await?;
@@ -152,9 +158,14 @@ async fn seed(store: &Store, job: JobId, runs: i64, ended: &Timestamp) -> Result
 }
 
 async fn plan(store: &Store, sql: &str) -> Result<String> {
-    let rows: Vec<(i64, i64, i64, String)> =
-        sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}")).fetch_all(store.pool()).await?;
-    Ok(rows.into_iter().map(|row| row.3).collect::<Vec<_>>().join(" | "))
+    let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .fetch_all(store.pool())
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.3)
+        .collect::<Vec<_>>()
+        .join(" | "))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -173,7 +184,9 @@ async fn history_scale() -> Result<()> {
 
     let mut jobs = Vec::new();
     for index in 0..JOBS {
-        let (job, _, _) = store.submit_job(&spec(&format!("job{index}"), &anchor), &anchor).await?;
+        let (job, _, _) = store
+            .submit_job(&spec(&format!("job{index}"), &anchor), &anchor)
+            .await?;
         seed(&store, job, per_job, &recent).await?;
         jobs.push(job);
     }
@@ -198,7 +211,10 @@ async fn history_scale() -> Result<()> {
 
     // The soak's configuration: retention wider than the history, so the
     // sweep prunes nothing — whatever it costs is pure overhead.
-    let retained = Retention { days: 3650, runs_per_job: 1_000_000 };
+    let retained = Retention {
+        days: 3650,
+        runs_per_job: 1_000_000,
+    };
     reset_peak();
     let before = status_kib("VmRSS:");
     let started = Instant::now();
@@ -210,7 +226,10 @@ async fn history_scale() -> Result<()> {
 
     // A real prune, with firings for another job arriving throughout: how
     // long does any one firing wait behind the sweep?
-    let bounded = Retention { days: 3650, runs_per_job: 100 };
+    let bounded = Retention {
+        days: 3650,
+        runs_per_job: 100,
+    };
     let firing = {
         let (store, job) = (store.clone(), jobs[2]);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

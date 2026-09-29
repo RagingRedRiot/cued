@@ -118,7 +118,6 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     true
 }
 
-
 /// The §6.3 gate, run on every submission regardless of front-end.
 ///
 /// Takes the whole spec rather than the graph alone because §6.3 asks for
@@ -144,16 +143,25 @@ pub fn validate(spec: &JobSpec) -> Result<()> {
 fn check_schedule(schedule: &Schedule) -> Result<()> {
     match schedule {
         Schedule::Once { .. } => Ok(()),
-        Schedule::Every { interval, until, count, .. } => {
+        Schedule::Every {
+            interval,
+            until,
+            count,
+            ..
+        } => {
             ensure!(
                 interval.is_positive(),
                 "an `every` interval must be positive (got {interval:#})"
             );
             check_limits(until, count)
         }
-        Schedule::Calendar { spec, zone, until, count } => {
-            jiff::tz::TimeZone::get(zone)
-                .with_context(|| format!("unknown time zone {zone:?}"))?;
+        Schedule::Calendar {
+            spec,
+            zone,
+            until,
+            count,
+        } => {
+            jiff::tz::TimeZone::get(zone).with_context(|| format!("unknown time zone {zone:?}"))?;
             check_calendar(spec)?;
             check_limits(until, count)
         }
@@ -274,8 +282,11 @@ fn back_edges(graph: &Graph) -> Vec<(StepId, StepId)> {
         Black,
     }
 
-    let mut marks: BTreeMap<&str, Mark> =
-        graph.steps.keys().map(|id| (id.as_str(), Mark::White)).collect();
+    let mut marks: BTreeMap<&str, Mark> = graph
+        .steps
+        .keys()
+        .map(|id| (id.as_str(), Mark::White))
+        .collect();
     let mut found = Vec::new();
 
     for root in graph.steps.keys() {
@@ -351,10 +362,9 @@ fn check_step_id(id: &StepId) -> Result<()> {
 /// — only Succeeded / Failed / TimedOut (and the Always fallthrough) apply.
 fn check_notify_condition(step: &StepId, condition: &Condition) -> Result<()> {
     match condition {
-        Condition::Always
-        | Condition::Succeeded
-        | Condition::Failed
-        | Condition::TimedOut => Ok(()),
+        Condition::Always | Condition::Succeeded | Condition::Failed | Condition::TimedOut => {
+            Ok(())
+        }
         Condition::All(inner) => {
             for condition in inner {
                 check_notify_condition(step, condition)?;
@@ -679,7 +689,10 @@ pub struct SubmitContext<'a> {
 /// caller's next step and the daemon's regardless.
 pub fn from_toml(text: &str, context: SubmitContext<'_>) -> Result<JobSpec> {
     let file: FileJob = toml::from_str(text).context("parsing the workflow file")?;
-    ensure!(!file.step.is_empty(), "a workflow file needs at least one [[step]]");
+    ensure!(
+        !file.step.is_empty(),
+        "a workflow file needs at least one [[step]]"
+    );
 
     // §9's inbound translation, resolved once for the whole file: the
     // command line wins, then the file's own key, then the machine's zone.
@@ -690,8 +703,10 @@ pub fn from_toml(text: &str, context: SubmitContext<'_>) -> Result<JobSpec> {
     };
     // The same instant, re-expressed in the zone we are reading against.
     let now = context.now.timestamp().to_zoned(zone);
-    let context = SubmitContext { now: &now, ..context };
-
+    let context = SubmitContext {
+        now: &now,
+        ..context
+    };
 
     let entry = match &file.entry {
         Some(entry) => entry.clone(),
@@ -793,11 +808,19 @@ fn build_schedule(file: &FileJob, context: &SubmitContext<'_>) -> Result<Schedul
     let count = file.count;
     match &mut schedule {
         Schedule::Once { .. } => unreachable!("handled above"),
-        Schedule::Every { until: slot, count: cap, .. } => {
+        Schedule::Every {
+            until: slot,
+            count: cap,
+            ..
+        } => {
             *slot = until;
             *cap = count;
         }
-        Schedule::Calendar { until: slot, count: cap, .. } => {
+        Schedule::Calendar {
+            until: slot,
+            count: cap,
+            ..
+        } => {
             // The rule's zone is already the reading zone — `every_schedule`
             // takes it from `now`, and `now` was re-zoned above.
             *slot = until;
@@ -825,7 +848,12 @@ pub fn every_schedule(spec: &str, at: Option<&str>, now: &Zoned) -> Result<Sched
             Some(time) => timeparse::parse_instant(time, now)?,
             None => now.timestamp(),
         };
-        return Ok(Schedule::Every { interval, anchor, until: None, count: None });
+        return Ok(Schedule::Every {
+            interval,
+            anchor,
+            until: None,
+            count: None,
+        });
     }
     let calendar = timeparse::parse_calendar(spec)?;
     ensure!(
@@ -835,7 +863,12 @@ pub fn every_schedule(spec: &str, at: Option<&str>, now: &Zoned) -> Result<Sched
     // §9: a calendar rule is not an instant, so its zone is meaning rather
     // than presentation and has to be carried, not converted away.
     let zone = now.time_zone().iana_name().unwrap_or("UTC").to_string();
-    Ok(Schedule::Calendar { spec: calendar, zone, until: None, count: None })
+    Ok(Schedule::Calendar {
+        spec: calendar,
+        zone,
+        until: None,
+        count: None,
+    })
 }
 
 /// §10.1: built-in < config file < job < step. `base` is everything to the
@@ -917,7 +950,11 @@ fn build_step(step: &FileStep, now: &Zoned) -> Result<Step> {
         action,
         cwd: step.cwd.clone(),
         env: step.env.clone(),
-        timeout: step.timeout.as_deref().map(timeparse::parse_duration).transpose()?,
+        timeout: step
+            .timeout
+            .as_deref()
+            .map(timeparse::parse_duration)
+            .transpose()?,
         kill_grace: step
             .kill_grace
             .as_deref()
@@ -926,7 +963,11 @@ fn build_step(step: &FileStep, now: &Zoned) -> Result<Step> {
         transitions: build_transitions(step, now)?,
         max_visits: step.max_visits,
         restart_safe: step.restart_safe,
-        missed_wait: step.missed_wait.as_deref().map(parse_missed_wait).transpose()?,
+        missed_wait: step
+            .missed_wait
+            .as_deref()
+            .map(parse_missed_wait)
+            .transpose()?,
     })
 }
 
@@ -954,7 +995,10 @@ fn build_transitions(step: &FileStep, now: &Zoned) -> Result<Vec<Transition>> {
             (Condition::Always, &on.always),
         ] {
             if let Some(effect) = effect {
-                out.push(Transition { when: condition, then: build_effect(effect, &step.id, now)? });
+                out.push(Transition {
+                    when: condition,
+                    then: build_effect(effect, &step.id, now)?,
+                });
             }
         }
         return Ok(out);
@@ -1031,7 +1075,11 @@ fn build_effect(effect: &FileEffect, step: &str, now: &Zoned) -> Result<Effect> 
     match (&effect.goto, &effect.end) {
         (Some(target), None) => Ok(Effect::Goto {
             step: target.clone(),
-            after: effect.after.as_ref().map(|a| build_wait(a, now)).transpose()?,
+            after: effect
+                .after
+                .as_ref()
+                .map(|a| build_wait(a, now))
+                .transpose()?,
         }),
         (None, Some(outcome)) => {
             ensure!(
@@ -1039,8 +1087,12 @@ fn build_effect(effect: &FileEffect, step: &str, now: &Zoned) -> Result<Effect> 
                 "step {step:?}: `after` delays a goto; an `end` has nothing to wait for"
             );
             match outcome.as_str() {
-                "success" => Ok(Effect::End { outcome: Outcome::Success }),
-                "failure" => Ok(Effect::End { outcome: Outcome::Failure }),
+                "success" => Ok(Effect::End {
+                    outcome: Outcome::Success,
+                }),
+                "failure" => Ok(Effect::End {
+                    outcome: Outcome::Failure,
+                }),
                 other => bail!("step {step:?}: unknown end {other:?} — success | failure"),
             }
         }
@@ -1069,7 +1121,10 @@ fn build_wait(after: &FileAfter, now: &Zoned) -> Result<Wait> {
                 table.factor.context("backoff needs `factor`")?,
                 table.max.as_deref().context("backoff needs `max`")?,
             );
-            ensure!(factor >= 1.0, "a backoff factor below 1 shrinks the delay (got {factor})");
+            ensure!(
+                factor >= 1.0,
+                "a backoff factor below 1 shrinks the delay (got {factor})"
+            );
             Ok(Wait::Backoff {
                 start: timeparse::parse_duration(start)?,
                 factor,
@@ -1087,7 +1142,9 @@ fn spec_for(graph: Graph, policies: Policies) -> JobSpec {
     JobSpec {
         name: None,
         schedule: Schedule::Once {
-            at: "2026-07-16T09:00:00-06:00[America/Denver]".parse().expect("instant"),
+            at: "2026-07-16T09:00:00-06:00[America/Denver]"
+                .parse()
+                .expect("instant"),
         },
         graph,
         cwd: "/tmp".into(),
@@ -1139,12 +1196,29 @@ mod tests {
         let keep = vec!["CUED_TEST_KEPT_TOKEN".to_string()];
         let captured = capture_env(&deny, &keep);
 
-        assert_eq!(captured.vars.get("CUED_TEST_PLAIN").map(String::as_str), Some("1"));
+        assert_eq!(
+            captured.vars.get("CUED_TEST_PLAIN").map(String::as_str),
+            Some("1")
+        );
         assert!(!captured.vars.contains_key("CUED_TEST_API_TOKEN"));
-        assert!(captured.stripped.contains(&"CUED_TEST_API_TOKEN".to_string()));
+        assert!(
+            captured
+                .stripped
+                .contains(&"CUED_TEST_API_TOKEN".to_string())
+        );
         // --keep-env: retained AND not recorded as stripped.
-        assert_eq!(captured.vars.get("CUED_TEST_KEPT_TOKEN").map(String::as_str), Some("hunter3"));
-        assert!(!captured.stripped.contains(&"CUED_TEST_KEPT_TOKEN".to_string()));
+        assert_eq!(
+            captured
+                .vars
+                .get("CUED_TEST_KEPT_TOKEN")
+                .map(String::as_str),
+            Some("hunter3")
+        );
+        assert!(
+            !captured
+                .stripped
+                .contains(&"CUED_TEST_KEPT_TOKEN".to_string())
+        );
     }
 
     #[test]
@@ -1154,17 +1228,40 @@ mod tests {
 
         let mut bad_entry = good.clone();
         bad_entry.entry = "nope".into();
-        assert!(validate(&spec_for(bad_entry, Policies::default())).unwrap_err().to_string().contains("entry"));
+        assert!(
+            validate(&spec_for(bad_entry, Policies::default()))
+                .unwrap_err()
+                .to_string()
+                .contains("entry")
+        );
 
         let empty_argv = single_shell_graph(vec![]);
-        assert!(validate(&spec_for(empty_argv, Policies::default())).unwrap_err().to_string().contains("argv"));
+        assert!(
+            validate(&spec_for(empty_argv, Policies::default()))
+                .unwrap_err()
+                .to_string()
+                .contains("argv")
+        );
 
         let mut bad_goto = good.clone();
-        bad_goto.steps.get_mut("run").unwrap().transitions.push(Transition {
-            when: Condition::Always,
-            then: Effect::Goto { step: "ghost".into(), after: None },
-        });
-        assert!(validate(&spec_for(bad_goto, Policies::default())).unwrap_err().to_string().contains("ghost"));
+        bad_goto
+            .steps
+            .get_mut("run")
+            .unwrap()
+            .transitions
+            .push(Transition {
+                when: Condition::Always,
+                then: Effect::Goto {
+                    step: "ghost".into(),
+                    after: None,
+                },
+            });
+        assert!(
+            validate(&spec_for(bad_goto, Policies::default()))
+                .unwrap_err()
+                .to_string()
+                .contains("ghost")
+        );
     }
 
     #[test]
@@ -1172,14 +1269,25 @@ mod tests {
         let mut graph = single_shell_graph(vec!["/bin/true".into()]);
         let step = graph.steps.get_mut("run").unwrap();
         step.action = Action::Notify {
-            title: NotifySpec { title: "t".into(), body: "b".into() }.title,
+            title: NotifySpec {
+                title: "t".into(),
+                body: "b".into(),
+            }
+            .title,
             body: "b".into(),
         };
         step.transitions.push(Transition {
             when: Condition::ExitEq(0),
-            then: Effect::End { outcome: crate::model::Outcome::Success },
+            then: Effect::End {
+                outcome: crate::model::Outcome::Success,
+            },
         });
-        assert!(validate(&spec_for(graph, Policies::default())).unwrap_err().to_string().contains("notify"));
+        assert!(
+            validate(&spec_for(graph, Policies::default()))
+                .unwrap_err()
+                .to_string()
+                .contains("notify")
+        );
     }
 }
 
@@ -1194,7 +1302,9 @@ mod file_tests {
     use crate::model::{Job, JobId, JobStatus};
 
     fn now() -> Zoned {
-        "2026-07-16T09:00:00-06:00[America/Denver]".parse().expect("now")
+        "2026-07-16T09:00:00-06:00[America/Denver]"
+            .parse()
+            .expect("now")
     }
 
     fn parse(text: &str) -> Result<JobSpec> {
@@ -1221,7 +1331,10 @@ mod file_tests {
             name: spec.name,
             schedule: spec.schedule,
             status: JobStatus::Active,
-            approval: None, source: crate::model::JobSource::Cli, expired_at: None, expiry_reason: None,
+            approval: None,
+            source: crate::model::JobSource::Cli,
+            expired_at: None,
+            expiry_reason: None,
             graph: spec.graph,
             cwd: spec.cwd,
             env: spec.env,
@@ -1345,7 +1458,11 @@ on.timeout = { end = "failure" }
             .iter()
             .map(|transition| format!("{:?}", transition.when))
             .collect();
-        assert_eq!(order, ["TimedOut", "Failed", "Succeeded", "Always"], "{order:?}");
+        assert_eq!(
+            order,
+            ["TimedOut", "Failed", "Succeeded", "Always"],
+            "{order:?}"
+        );
     }
 
     /// Both tiers are ordered and first-match-wins, so interleaving them
@@ -1381,7 +1498,10 @@ then = { end = "failure" }
             // `{:#}` walks the anyhow chain — the serde detail is the
             // cause, under our own "parsing the workflow file" context.
             let error = format!("{:#}", parse(text).unwrap_err());
-            assert!(error.contains("unknown field"), "expected a rejection, got: {error}");
+            assert!(
+                error.contains("unknown field"),
+                "expected a rejection, got: {error}"
+            );
         }
     }
 
@@ -1392,7 +1512,8 @@ then = { end = "failure" }
         let once = parse("at = \"9am\"\n[[step]]\nid=\"a\"\nrun=\"/bin/true\"\n").expect("once");
         assert!(matches!(once.schedule, Schedule::Once { .. }));
 
-        let every = parse("every = \"6h\"\n[[step]]\nid=\"a\"\nrun=\"/bin/true\"\n").expect("every");
+        let every =
+            parse("every = \"6h\"\n[[step]]\nid=\"a\"\nrun=\"/bin/true\"\n").expect("every");
         assert!(matches!(every.schedule, Schedule::Every { .. }));
 
         let anchored = parse(
@@ -1458,8 +1579,8 @@ then = { end = "failure" }
         };
 
         // A file that says nothing about policy inherits all of it.
-        let quiet = parse_with("at = \"9am\"\n[[step]]\nid=\"a\"\nrun=\"/bin/true\"\n")
-            .expect("parse");
+        let quiet =
+            parse_with("at = \"9am\"\n[[step]]\nid=\"a\"\nrun=\"/bin/true\"\n").expect("parse");
         assert_eq!(quiet.policies.missed_wait, MissedWait::Abandon);
         assert_eq!(quiet.policies.on_interrupt, OnInterrupt::Fail);
         assert_eq!(quiet.policies.catch_up, CatchUp::Skip);
@@ -1476,8 +1597,15 @@ then = { end = "failure" }
         .expect("parse");
         assert_eq!(loud.policies.missed_wait, MissedWait::RunAsap, "file wins");
         assert_eq!(loud.policies.overlap, Overlap::Skip, "file wins");
-        assert_eq!(loud.policies.deadline, Some(SignedDuration::from_secs(1800)));
-        assert_eq!(loud.policies.on_interrupt, OnInterrupt::Fail, "still inherited");
+        assert_eq!(
+            loud.policies.deadline,
+            Some(SignedDuration::from_secs(1800))
+        );
+        assert_eq!(
+            loud.policies.on_interrupt,
+            OnInterrupt::Fail,
+            "still inherited"
+        );
         assert_eq!(loud.policies.catch_up, CatchUp::Skip, "still inherited");
     }
 
@@ -1506,9 +1634,15 @@ then = { end = "failure" }
         )
         .expect("parse");
 
-        assert_eq!(spec.env.vars.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(
+            spec.env.vars.get("PATH").map(String::as_str),
+            Some("/usr/bin")
+        );
         assert_eq!(spec.env.vars.get("EXTRA").map(String::as_str), Some("1"));
-        assert_eq!(spec.env.vars.get("DEPLOY_TOKEN").map(String::as_str), Some("pinned"));
+        assert_eq!(
+            spec.env.vars.get("DEPLOY_TOKEN").map(String::as_str),
+            Some("pinned")
+        );
         assert!(
             !spec.env.stripped.contains(&"DEPLOY_TOKEN".to_string()),
             "a pinned var is no longer stripped"
@@ -1574,7 +1708,14 @@ mod chain_tests {
     #[test]
     fn the_order_the_links_were_typed_in_is_recovered() {
         let after_first = chain_links(&args(&[
-            "cued", "chain", "A", "--then-after", "1h", "B", "--then", "C",
+            "cued",
+            "chain",
+            "A",
+            "--then-after",
+            "1h",
+            "B",
+            "--then",
+            "C",
         ]))
         .expect("links");
         assert_eq!(
@@ -1586,7 +1727,14 @@ mod chain_tests {
         );
 
         let after_last = chain_links(&args(&[
-            "cued", "chain", "A", "--then", "B", "--then-after", "1h", "C",
+            "cued",
+            "chain",
+            "A",
+            "--then",
+            "B",
+            "--then-after",
+            "1h",
+            "C",
         ]))
         .expect("links");
         assert_eq!(
@@ -1659,22 +1807,22 @@ mod chain_tests {
             graph.steps["step3"].transitions.is_empty(),
             "the last link ends the run by §3.2's derived End"
         );
-        validate(&spec_for(graph.clone(), Policies::default())).expect("a chain must pass the §6.3 gate");
+        validate(&spec_for(graph.clone(), Policies::default()))
+            .expect("a chain must pass the §6.3 gate");
     }
 
     /// §3.2 fail-fast does the work for `stop`: nothing handles the failure,
     /// so the run ends there. `continue` needs the edge to be unconditional.
     #[test]
     fn the_failure_policy_is_one_edge_condition() {
-        let stop = chain_graph("A", &[Link::Then("B".into())], ChainFailure::Stop)
-            .expect("graph");
+        let stop = chain_graph("A", &[Link::Then("B".into())], ChainFailure::Stop).expect("graph");
         assert!(matches!(
             stop.steps["step1"].transitions[0].when,
             Condition::Succeeded
         ));
 
-        let keep_going = chain_graph("A", &[Link::Then("B".into())], ChainFailure::Continue)
-            .expect("graph");
+        let keep_going =
+            chain_graph("A", &[Link::Then("B".into())], ChainFailure::Continue).expect("graph");
         assert!(matches!(
             keep_going.steps["step1"].transitions[0].when,
             Condition::Always
@@ -1684,8 +1832,7 @@ mod chain_tests {
     /// §2.2: a chain link is one quoted string, so it's the shell form.
     #[test]
     fn links_are_the_shell_form() {
-        let graph = chain_graph("make build && make test", &[], ChainFailure::Stop)
-            .expect("graph");
+        let graph = chain_graph("make build && make test", &[], ChainFailure::Stop).expect("graph");
         match &graph.steps["step1"].action {
             Action::Shell { argv } => {
                 assert_eq!(argv, &["/bin/sh", "-c", "make build && make test"]);
@@ -1696,9 +1843,13 @@ mod chain_tests {
 
     #[test]
     fn a_bad_wait_is_refused_at_submit() {
-        let error = chain_graph("A", &[Link::ThenAfter("later".into(), "B".into())], ChainFailure::Stop)
-            .unwrap_err()
-            .to_string();
+        let error = chain_graph(
+            "A",
+            &[Link::ThenAfter("later".into(), "B".into())],
+            ChainFailure::Stop,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("--then-after"), "{error}");
     }
 }
@@ -1714,7 +1865,9 @@ mod loop_bound_tests {
 
     fn step_with(goto: &[&str]) -> Step {
         Step {
-            action: Action::Shell { argv: vec!["/bin/true".into()] },
+            action: Action::Shell {
+                argv: vec!["/bin/true".into()],
+            },
             cwd: None,
             env: None,
             timeout: None,
@@ -1723,7 +1876,10 @@ mod loop_bound_tests {
                 .iter()
                 .map(|target| Transition {
                     when: Condition::Always,
-                    then: Effect::Goto { step: (*target).into(), after: None },
+                    then: Effect::Goto {
+                        step: (*target).into(),
+                        after: None,
+                    },
                 })
                 .collect(),
             max_visits: None,
@@ -1748,9 +1904,14 @@ mod loop_bound_tests {
     fn an_unbounded_loop_is_refused_and_either_bound_frees_it() {
         let looping = graph_of("poll", &[("poll", &["poll"][..])]);
 
-        let error = validate(&spec_for(looping.clone(), Policies::default())).unwrap_err().to_string();
+        let error = validate(&spec_for(looping.clone(), Policies::default()))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("loops back"), "{error}");
-        assert!(error.contains("max_visits") && error.contains("deadline"), "{error}");
+        assert!(
+            error.contains("max_visits") && error.contains("deadline"),
+            "{error}"
+        );
 
         // §3.2 caps how often the step may be re-entered…
         let mut capped = looping.clone();
@@ -1774,13 +1935,13 @@ mod loop_bound_tests {
     fn a_rejoining_branch_is_not_a_back_edge() {
         let diamond = graph_of(
             "a",
-            &[
-                ("a", &["b", "c"][..]),
-                ("b", &["c"][..]),
-                ("c", &[][..]),
-            ],
+            &[("a", &["b", "c"][..]), ("b", &["c"][..]), ("c", &[][..])],
         );
-        assert!(back_edges(&diamond).is_empty(), "{:?}", back_edges(&diamond));
+        assert!(
+            back_edges(&diamond).is_empty(),
+            "{:?}",
+            back_edges(&diamond)
+        );
         validate(&spec_for(diamond, Policies::default())).expect("a diamond has no loop to bound");
     }
 
@@ -1799,14 +1960,7 @@ mod loop_bound_tests {
     /// hiding there still has to be bounded.
     #[test]
     fn a_cycle_unreachable_from_entry_is_still_checked() {
-        let stranded = graph_of(
-            "a",
-            &[
-                ("a", &[][..]),
-                ("x", &["y"][..]),
-                ("y", &["x"][..]),
-            ],
-        );
+        let stranded = graph_of("a", &[("a", &[][..]), ("x", &["y"][..]), ("y", &["x"][..])]);
         assert!(
             validate(&spec_for(stranded, Policies::default())).is_err(),
             "a loop only reachable via `retry --from` is still a loop"
@@ -1850,7 +2004,9 @@ mod schedule_gate_tests {
     fn every(interval_secs: i64) -> Schedule {
         Schedule::Every {
             interval: SignedDuration::from_secs(interval_secs),
-            anchor: "2026-07-16T09:00:00-06:00[America/Denver]".parse().expect("anchor"),
+            anchor: "2026-07-16T09:00:00-06:00[America/Denver]"
+                .parse()
+                .expect("anchor"),
             until: None,
             count: None,
         }
@@ -1872,7 +2028,9 @@ mod schedule_gate_tests {
     fn a_non_positive_interval_is_refused_at_submit() {
         // Divides by zero in §4.2's catch-up arithmetic if it gets through.
         for seconds in [0, -60] {
-            let error = validate(&spec_with(every(seconds))).unwrap_err().to_string();
+            let error = validate(&spec_with(every(seconds)))
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("must be positive"), "{error}");
         }
         validate(&spec_with(every(60))).expect("a positive interval is fine");
@@ -1881,7 +2039,9 @@ mod schedule_gate_tests {
     #[test]
     fn an_unknown_time_zone_is_refused() {
         let error = validate(&spec_with(calendar(
-            CalendarSpec::Daily { at: time(9, 0, 0, 0) },
+            CalendarSpec::Daily {
+                at: time(9, 0, 0, 0),
+            },
             "Nowhere/Nothing",
         )))
         .unwrap_err()
@@ -1889,7 +2049,9 @@ mod schedule_gate_tests {
         assert!(error.contains("time zone"), "{error}");
 
         validate(&spec_with(calendar(
-            CalendarSpec::Daily { at: time(9, 0, 0, 0) },
+            CalendarSpec::Daily {
+                at: time(9, 0, 0, 0),
+            },
             "America/Denver",
         )))
         .expect("a real zone is fine");
@@ -1901,13 +2063,19 @@ mod schedule_gate_tests {
     #[test]
     fn a_calendar_rule_that_can_never_match_is_refused() {
         let empty_week = calendar(
-            CalendarSpec::Weekly { days: Vec::new(), at: time(9, 0, 0, 0) },
+            CalendarSpec::Weekly {
+                days: Vec::new(),
+                at: time(9, 0, 0, 0),
+            },
             "UTC",
         );
         assert!(validate(&spec_with(empty_week)).is_err());
 
         let empty_month = calendar(
-            CalendarSpec::Monthly { days: Vec::new(), at: time(9, 0, 0, 0) },
+            CalendarSpec::Monthly {
+                days: Vec::new(),
+                at: time(9, 0, 0, 0),
+            },
             "UTC",
         );
         assert!(validate(&spec_with(empty_month)).is_err());
@@ -1964,7 +2132,9 @@ mod schedule_gate_tests {
     #[test]
     fn a_one_off_cannot_carry_recurrence_limits() {
         let once = Schedule::Once {
-            at: "2026-07-16T09:00:00-06:00[America/Denver]".parse().expect("at"),
+            at: "2026-07-16T09:00:00-06:00[America/Denver]"
+                .parse()
+                .expect("at"),
         };
         assert_eq!(once.count(), None, "Once must have no firing cap to carry");
         validate(&spec_with(once)).expect("a plain one-off is valid");
@@ -1992,7 +2162,9 @@ mod zone_tests {
     /// instead. The schedule honoured the key and the graph did not.
     #[test]
     fn the_files_zone_reaches_transition_until_times() {
-        let denver: Zoned = "2026-07-16T09:00:00-06:00[America/Denver]".parse().expect("now");
+        let denver: Zoned = "2026-07-16T09:00:00-06:00[America/Denver]"
+            .parse()
+            .expect("now");
         let parse = |text: &str| {
             from_toml(
                 text,
@@ -2033,7 +2205,9 @@ run = "/bin/true"
         // …and the transition's wall time is read in the same zone, which is
         // the half that used to fall through to the machine's.
         let wait = match &spec.graph.steps["a"].transitions[0].then {
-            Effect::Goto { after: Some(wait), .. } => wait,
+            Effect::Goto {
+                after: Some(wait), ..
+            } => wait,
             other => panic!("expected a goto with a wait, got {other:?}"),
         };
         match wait {

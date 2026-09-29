@@ -16,9 +16,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
 
 use cued::config::Retention;
 use cued::daemon::collect_garbage;
-use cued::model::{
-    CapturedEnv, Hooks, JobId, JobSpec, Policies, RunId, RunStatus, Schedule,
-};
+use cued::model::{CapturedEnv, Hooks, JobId, JobSpec, Policies, RunId, RunStatus, Schedule};
 use cued::paths::Paths;
 use cued::store::{Fired, Firing, NextCursor, StepClose, Store};
 use cued::submit::single_shell_graph;
@@ -43,7 +41,11 @@ async fn harness() -> Result<Harness> {
     };
     std::fs::create_dir_all(&paths.logs_dir)?;
     let store = Store::open(&paths.db_file).await?;
-    Ok(Harness { _dir: dir, paths, store })
+    Ok(Harness {
+        _dir: dir,
+        paths,
+        store,
+    })
 }
 
 fn spec(name: &str, schedule: Schedule) -> JobSpec {
@@ -69,7 +71,11 @@ fn every_minute(anchor: &Timestamp) -> Schedule {
 
 /// Claim, log and close one waiting run, the way the daemon would.
 async fn finish_run(h: &Harness, job: JobId, run: RunId, at: &Timestamp) -> Result<()> {
-    let attempt = h.store.begin_step(job, run, "run", at).await?.expect("claim");
+    let attempt = h
+        .store
+        .begin_step(job, run, "run", at)
+        .await?
+        .expect("claim");
     let log = h.paths.step_log(job, run, "run", attempt);
     std::fs::create_dir_all(log.parent().expect("parent"))?;
     std::fs::write(&log, b"output\n")?;
@@ -84,7 +90,10 @@ async fn finish_run(h: &Harness, job: JobId, run: RunId, at: &Timestamp) -> Resu
             exit_code: Some(0),
             timed_out: false,
             outcome_edge: None,
-            next: NextCursor::Terminal { status: RunStatus::Done, fail_reason: None },
+            next: NextCursor::Terminal {
+                status: RunStatus::Done,
+                fail_reason: None,
+            },
             notifications: Vec::new(),
         })
         .await?;
@@ -187,10 +196,9 @@ async fn a_run_retried_during_a_sweep_is_not_collected() -> Result<()> {
     let log_dir = h.paths.run_log_dir(job, run);
     assert!(log_dir.exists());
 
-    let mut rival = SqliteConnection::connect_with(
-        &SqliteConnectOptions::new().filename(&h.paths.db_file),
-    )
-    .await?;
+    let mut rival =
+        SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&h.paths.db_file))
+            .await?;
     sqlx::query("BEGIN IMMEDIATE").execute(&mut rival).await?;
     // Exactly what `Store::rewind_run` commits.
     sqlx::query(
@@ -212,18 +220,37 @@ async fn a_run_retried_during_a_sweep_is_not_collected() -> Result<()> {
     let sweep = {
         let (store, paths) = (h.store.clone(), h.paths.clone());
         tokio::spawn(async move {
-            collect_garbage(&store, &paths, &Retention { days: 30, runs_per_job: 20 }, &now)
-                .await
+            collect_garbage(
+                &store,
+                &paths,
+                &Retention {
+                    days: 30,
+                    runs_per_job: 20,
+                },
+                &now,
+            )
+            .await
         })
     };
     // Well inside the store's 5s busy timeout.
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(!sweep.is_finished(), "the sweep should be waiting for the write lock");
+    assert!(
+        !sweep.is_finished(),
+        "the sweep should be waiting for the write lock"
+    );
     sqlx::query("COMMIT").execute(&mut rival).await?;
     let outcome = sweep.await??;
 
-    assert!(outcome.runs.is_empty(), "a live run was collected: {:?}", outcome.runs);
-    assert_eq!(run_ids(&h.store, job).await, [run.0], "the retried run's row is gone");
+    assert!(
+        outcome.runs.is_empty(),
+        "a live run was collected: {:?}",
+        outcome.runs
+    );
+    assert_eq!(
+        run_ids(&h.store, job).await,
+        [run.0],
+        "the retried run's row is gone"
+    );
     let attempts: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM step_runs WHERE job_id = ? AND run_id = ?")
             .bind(job.0)
@@ -249,16 +276,31 @@ async fn pruned_run_ids_are_never_reused() -> Result<()> {
     let h = harness().await?;
     let now = Timestamp::now();
     let old = now.checked_sub(SignedDuration::from_hours(24 * 60))?;
-    let (job, _, _) = h.store.submit_job(&spec("quiet", every_minute(&old)), &old).await?;
+    let (job, _, _) = h
+        .store
+        .submit_job(&spec("quiet", every_minute(&old)), &old)
+        .await?;
     seed_done_runs(&h, job, 1..=3, |_| old).await?;
 
-    let retention = Retention { days: 30, runs_per_job: 20 };
+    let retention = Retention {
+        days: 30,
+        runs_per_job: 20,
+    };
     let pruned = h.store.gc(&retention, &now).await?;
-    assert_eq!(pruned.runs.len(), 3, "all three aged-out runs: {:?}", pruned.runs);
+    assert_eq!(
+        pruned.runs.len(),
+        3,
+        "all three aged-out runs: {:?}",
+        pruned.runs
+    );
 
     // A firing between the commit and the directory removal.
     let fresh = fire_once(&h, job, &now).await?;
-    let attempt = h.store.begin_step(job, fresh, "run", &now).await?.expect("claim");
+    let attempt = h
+        .store
+        .begin_step(job, fresh, "run", &now)
+        .await?
+        .expect("claim");
     let log = h.paths.step_log(job, fresh, "run", attempt);
     std::fs::create_dir_all(log.parent().expect("parent"))?;
     std::fs::write(&log, b"new output\n")?;
@@ -267,7 +309,10 @@ async fn pruned_run_ids_are_never_reused() -> Result<()> {
     for (job, run) in &pruned.runs {
         let _ = std::fs::remove_dir_all(h.paths.run_log_dir(*job, *run));
     }
-    assert!(log.exists(), "the new run's log was removed as a pruned run's ({fresh})");
+    assert!(
+        log.exists(),
+        "the new run's log was removed as a pruned run's ({fresh})"
+    );
     assert_eq!(fresh, RunId(4), "a pruned run id was handed out again");
     Ok(())
 }
@@ -280,8 +325,14 @@ async fn batched_sweep_keeps_exactly_the_newest_runs_of_every_job() -> Result<()
     let h = harness().await?;
     let now = Timestamp::now();
     let anchor = now.checked_sub(SignedDuration::from_hours(24 * 90))?;
-    let (busy, _, _) = h.store.submit_job(&spec("busy", every_minute(&anchor)), &anchor).await?;
-    let (quiet, _, _) = h.store.submit_job(&spec("quiet", every_minute(&anchor)), &anchor).await?;
+    let (busy, _, _) = h
+        .store
+        .submit_job(&spec("busy", every_minute(&anchor)), &anchor)
+        .await?;
+    let (quiet, _, _) = h
+        .store
+        .submit_job(&spec("quiet", every_minute(&anchor)), &anchor)
+        .await?;
 
     // 2,500 recent runs for one job; a handful of old ones for the other.
     seed_done_runs(&h, busy, 1..=2500, |_| now).await?;
@@ -295,7 +346,10 @@ async fn batched_sweep_keeps_exactly_the_newest_runs_of_every_job() -> Result<()
     let outcome = collect_garbage(
         &h.store,
         &h.paths,
-        &Retention { days: 30, runs_per_job: 10 },
+        &Retention {
+            days: 30,
+            runs_per_job: 10,
+        },
         &now,
     )
     .await?;
@@ -303,7 +357,10 @@ async fn batched_sweep_keeps_exactly_the_newest_runs_of_every_job() -> Result<()
     let mut expected: Vec<i64> = vec![7];
     expected.extend(2491..=2500);
     assert_eq!(run_ids(&h.store, busy).await, expected);
-    assert!(run_ids(&h.store, quiet).await.is_empty(), "the quiet job's old runs age out");
+    assert!(
+        run_ids(&h.store, quiet).await.is_empty(),
+        "the quiet job's old runs age out"
+    );
     assert_eq!(outcome.runs.len(), 2500 - 11 + 5);
     let orphaned: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM step_runs WHERE NOT EXISTS
@@ -314,7 +371,16 @@ async fn batched_sweep_keeps_exactly_the_newest_runs_of_every_job() -> Result<()
     assert_eq!(orphaned, 0, "attempt rows outlived their runs");
 
     // A second sweep finds nothing left to do.
-    let again = h.store.gc(&Retention { days: 30, runs_per_job: 10 }, &now).await?;
+    let again = h
+        .store
+        .gc(
+            &Retention {
+                days: 30,
+                runs_per_job: 10,
+            },
+            &now,
+        )
+        .await?;
     assert!(again.runs.is_empty() && again.jobs.is_empty(), "{again:?}");
     Ok(())
 }
@@ -334,15 +400,34 @@ async fn the_age_cutoff_is_exact_within_its_second() -> Result<()> {
     assert!(whole_second < cutoff && cutoff < later_fraction);
 
     let anchor = now.checked_sub(SignedDuration::from_hours(24 * 90))?;
-    let (job, _, _) = h.store.submit_job(&spec("edge", every_minute(&anchor)), &anchor).await?;
-    seed_done_runs(&h, job, 1..=2, |id| if id == 1 { whole_second } else { later_fraction })
+    let (job, _, _) = h
+        .store
+        .submit_job(&spec("edge", every_minute(&anchor)), &anchor)
         .await?;
+    seed_done_runs(&h, job, 1..=2, |id| {
+        if id == 1 {
+            whole_second
+        } else {
+            later_fraction
+        }
+    })
+    .await?;
 
     let outcome = h
         .store
-        .gc(&Retention { days: days as u32, runs_per_job: 100 }, &now)
+        .gc(
+            &Retention {
+                days: days as u32,
+                runs_per_job: 100,
+            },
+            &now,
+        )
         .await?;
-    assert_eq!(outcome.runs, [(job, RunId(1))], "only the run that ended before the cutoff");
+    assert_eq!(
+        outcome.runs,
+        [(job, RunId(1))],
+        "only the run that ended before the cutoff"
+    );
     assert_eq!(run_ids(&h.store, job).await, [2]);
     Ok(())
 }
@@ -355,13 +440,24 @@ async fn fired_run_ids_stay_unique_after_pruning_everything() -> Result<()> {
     let h = harness().await?;
     let now = Timestamp::now();
     let anchor = now.checked_sub(SignedDuration::from_hours(1))?;
-    let (job, _, _) = h.store.submit_job(&spec("drained", every_minute(&anchor)), &anchor).await?;
+    let (job, _, _) = h
+        .store
+        .submit_job(&spec("drained", every_minute(&anchor)), &anchor)
+        .await?;
     for _ in 0..3 {
         let run = fire_once(&h, job, &now).await?;
         finish_run(&h, job, run, &now).await?;
     }
-    let pruned =
-        collect_garbage(&h.store, &h.paths, &Retention { days: 30, runs_per_job: 0 }, &now).await?;
+    let pruned = collect_garbage(
+        &h.store,
+        &h.paths,
+        &Retention {
+            days: 30,
+            runs_per_job: 0,
+        },
+        &now,
+    )
+    .await?;
     assert_eq!(pruned.runs.len(), 3);
     assert!(run_ids(&h.store, job).await.is_empty());
     assert_eq!(fire_once(&h, job, &now).await?, RunId(4));
@@ -376,10 +472,14 @@ async fn a_sweep_failing_part_way_still_removes_the_logs_it_pruned() -> Result<(
     let h = harness().await?;
     let now = Timestamp::now();
     let old = now.checked_sub(SignedDuration::from_hours(24 * 60))?;
-    let (job, _, _) = h.store.submit_job(&spec("partial", every_minute(&old)), &old).await?;
+    let (job, _, _) = h
+        .store
+        .submit_job(&spec("partial", every_minute(&old)), &old)
+        .await?;
     // Distinct end times give the age walk a known order: id order.
     seed_done_runs(&h, job, 1..=600, |id| {
-        old.checked_add(SignedDuration::from_secs(id)).expect("in range")
+        old.checked_add(SignedDuration::from_secs(id))
+            .expect("in range")
     })
     .await?;
     for id in [1, 600] {
@@ -394,14 +494,35 @@ async fn a_sweep_failing_part_way_still_removes_the_logs_it_pruned() -> Result<(
     .execute(h.store.pool())
     .await?;
 
-    let swept =
-        collect_garbage(&h.store, &h.paths, &Retention { days: 30, runs_per_job: 20 }, &now).await;
+    let swept = collect_garbage(
+        &h.store,
+        &h.paths,
+        &Retention {
+            days: 30,
+            runs_per_job: 20,
+        },
+        &now,
+    )
+    .await;
     let error = swept.expect_err("the injected failure must surface");
-    assert!(format!("{error:#}").contains("injected gc failure"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("injected gc failure"),
+        "{error:#}"
+    );
     let remaining = run_ids(&h.store, job).await;
-    assert_eq!(remaining.first(), Some(&513), "two batches of 256 committed: {remaining:?}");
-    assert!(!h.paths.run_log_dir(job, RunId(1)).exists(), "a pruned run's logs leaked");
-    assert!(h.paths.run_log_dir(job, RunId(600)).exists(), "an unpruned run's logs went");
+    assert_eq!(
+        remaining.first(),
+        Some(&513),
+        "two batches of 256 committed: {remaining:?}"
+    );
+    assert!(
+        !h.paths.run_log_dir(job, RunId(1)).exists(),
+        "a pruned run's logs leaked"
+    );
+    assert!(
+        h.paths.run_log_dir(job, RunId(600)).exists(),
+        "an unpruned run's logs went"
+    );
     Ok(())
 }
 
@@ -413,10 +534,16 @@ async fn concurrent_sweeps_split_the_work_without_overlap() -> Result<()> {
     let h = harness().await?;
     let now = Timestamp::now();
     let old = now.checked_sub(SignedDuration::from_hours(24 * 60))?;
-    let (job, _, _) = h.store.submit_job(&spec("contended", every_minute(&old)), &old).await?;
+    let (job, _, _) = h
+        .store
+        .submit_job(&spec("contended", every_minute(&old)), &old)
+        .await?;
     seed_done_runs(&h, job, 1..=3000, |_| old).await?;
 
-    let retention = Retention { days: 30, runs_per_job: 20 };
+    let retention = Retention {
+        days: 30,
+        runs_per_job: 20,
+    };
     let (first, second) = tokio::join!(
         collect_garbage(&h.store, &h.paths, &retention, &now),
         collect_garbage(&h.store, &h.paths, &retention, &now),

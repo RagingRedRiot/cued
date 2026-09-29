@@ -172,9 +172,7 @@ pub async fn serve_with<N: Notifier + 'static>(
 /// Resolve on SIGTERM (what a service manager sends) or SIGINT (what a
 /// terminal sends), naming which arrived.
 async fn shutdown_signal() -> &'static str {
-    let mut term = match tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate(),
-    ) {
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(term) => term,
         // Without a handler there is nothing to wait for; the default
         // disposition still ends the process, just without the teardown.
@@ -262,7 +260,9 @@ async fn delivery_loop<N: Notifier>(
 ) {
     let mut ledger = DeliveryLedger::default();
     loop {
-        if let Err(error) = deliver_pending(&store, &notifier, &mut ledger, &SystemClock.now()).await {
+        if let Err(error) =
+            deliver_pending(&store, &notifier, &mut ledger, &SystemClock.now()).await
+        {
             eprintln!("cued: notification delivery pass failed: {error:#}");
         }
         tokio::select! {
@@ -316,8 +316,9 @@ pub async fn deliver_pending(
     // Recorded elsewhere or deleted (retention) since: nothing to remember.
     ledger.shown.retain(|id, _| pending_ids.contains(id));
 
-    let (shown, unshown): (Vec<_>, Vec<_>) =
-        pending.into_iter().partition(|row| ledger.shown.contains_key(&row.id));
+    let (shown, unshown): (Vec<_>, Vec<_>) = pending
+        .into_iter()
+        .partition(|row| ledger.shown.contains_key(&row.id));
 
     let mut delivered = 0;
     let mut recording = true;
@@ -361,7 +362,12 @@ pub async fn deliver_pending(
     Ok(delivered)
 }
 
-async fn record(store: &Store, id: i64, receipt: Option<&DeliveryReceipt>, now: &Timestamp) -> bool {
+async fn record(
+    store: &Store,
+    id: i64,
+    receipt: Option<&DeliveryReceipt>,
+    now: &Timestamp,
+) -> bool {
     match store.mark_delivered(id, receipt, now).await {
         Ok(()) => true,
         Err(error) => {
@@ -481,8 +487,8 @@ fn acquire_instance_lock(paths: &Paths) -> Result<File> {
 /// socket makes "we hold the lock" true of the socket too.
 fn acquire_socket_lock(paths: &Paths) -> Result<File> {
     let path = paths.socket_file.with_extension("sock.lock");
-    let file = File::create(&path)
-        .with_context(|| format!("creating lock file {}", path.display()))?;
+    let file =
+        File::create(&path).with_context(|| format!("creating lock file {}", path.display()))?;
     file.try_lock().with_context(|| {
         format!(
             "another cued daemon is serving {} (possibly for a different data directory)",
@@ -499,9 +505,8 @@ fn bind_socket(paths: &Paths) -> Result<UnixListener> {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(|| {
-                format!("removing stale socket {}", paths.socket_file.display())
-            });
+            return Err(error)
+                .with_context(|| format!("removing stale socket {}", paths.socket_file.display()));
         }
     }
     UnixListener::bind(&paths.socket_file)
@@ -627,7 +632,10 @@ pub enum Arm {
         at: Timestamp,
         retry: u32,
     },
-    Fire { job: JobId, at: Timestamp },
+    Fire {
+        job: JobId,
+        at: Timestamp,
+    },
     /// A firing whose attempt failed with an internal error, re-armed at
     /// `at`. `claiming` stays the *original* instant, because that is what
     /// the store is still expecting — a retry has to claim the same firing,
@@ -644,9 +652,7 @@ impl Arm {
     fn at(&self) -> Timestamp {
         match self {
             Arm::Step(due) => due.at,
-            Arm::RetryStep { at, .. }
-            | Arm::Fire { at, .. }
-            | Arm::RetryFire { at, .. } => *at,
+            Arm::RetryStep { at, .. } | Arm::Fire { at, .. } | Arm::RetryFire { at, .. } => *at,
         }
     }
 }
@@ -698,7 +704,12 @@ async fn scheduler(ctx: Arc<Ctx>, mut arm: mpsc::UnboundedReceiver<Arm>) -> Resu
                 Arm::Fire { job, at } => {
                     tokio::spawn(fire_job_task(Arc::clone(&ctx), job, at, 0));
                 }
-                Arm::RetryFire { job, claiming, retry, .. } => {
+                Arm::RetryFire {
+                    job,
+                    claiming,
+                    retry,
+                    ..
+                } => {
                     tokio::spawn(fire_job_task(Arc::clone(&ctx), job, claiming, retry));
                 }
             }
@@ -781,7 +792,11 @@ async fn run_step(ctx: Arc<Ctx>, due: DueStep, retry: u32) {
                     "cued: re-arming {}.{} step {:?} in {delay:#}",
                     due.job, due.run, due.step
                 );
-                let _ = ctx.arm.send(Arm::RetryStep { due, at, retry: next });
+                let _ = ctx.arm.send(Arm::RetryStep {
+                    due,
+                    at,
+                    retry: next,
+                });
                 return;
             }
             // Unreachable short of the end of representable time; fall
@@ -824,7 +839,10 @@ async fn end_on_deadline(
             &job.graph.entry,
             ended_at,
             job.hooks.on_failure.as_ref(),
-            attempt.map(|attempt| Claim { step: &due.step, attempt }),
+            attempt.map(|attempt| Claim {
+                step: &due.step,
+                attempt,
+            }),
         )
         .await?;
     if let Some(drained) = outcome {
@@ -950,9 +968,7 @@ async fn try_run_step(ctx: &Ctx, due: &DueStep) -> Result<()> {
     // gets the same policy as a reboot.
     let missed_policy = step.missed_wait.unwrap_or(job.policies.missed_wait);
     let now = ctx.clock.now();
-    if missed_policy == MissedWait::Abandon
-        && now.duration_since(due.at) > MISSED_GRACE
-    {
+    if missed_policy == MissedWait::Abandon && now.duration_since(due.at) > MISSED_GRACE {
         let drained = ctx
             .store
             .mark_missed(
@@ -991,9 +1007,7 @@ async fn try_run_step(ctx: &Ctx, due: &DueStep) -> Result<()> {
     // sleep-edge. Checked before the claim, so a step that will never run
     // leaves no attempt behind saying it did.
     if let (Some(budget), Some(started)) = (budget, started_at.as_ref())
-        && started
-            .checked_add(budget)
-            .is_ok_and(|at| now >= at)
+        && started.checked_add(budget).is_ok_and(|at| now >= at)
     {
         return end_on_deadline(ctx, &job, due, None, &now).await;
     }
@@ -1003,25 +1017,29 @@ async fn try_run_step(ctx: &Ctx, due: &DueStep) -> Result<()> {
     // spawn.
     let Some(attempt) = ctx
         .store
-        .begin_step_checked(due.job, due.run, &due.step, &now, job.approval.as_ref().map(|a| a.definition_hash))
+        .begin_step_checked(
+            due.job,
+            due.run,
+            &due.step,
+            &now,
+            job.approval.as_ref().map(|a| a.definition_hash),
+        )
         .await?
     else {
         return Ok(());
     };
     // Everything below is a post-claim write, and each one has to prove this
     // attempt still owns the cursor before it moves the run (§3.3).
-    let claim = Claim { step: &due.step, attempt };
+    let claim = Claim {
+        step: &due.step,
+        attempt,
+    };
     crate::testhook::checkpoint("claimed", due.job, due.run, attempt).await;
 
     // The claim is what starts a run's clock, so a first step's budget runs
     // from the `now` it was just stamped with — no second read needed.
-    let deadline_at = budget.and_then(|budget| {
-        started_at
-            .as_ref()
-            .unwrap_or(&now)
-            .checked_add(budget)
-            .ok()
-    });
+    let deadline_at =
+        budget.and_then(|budget| started_at.as_ref().unwrap_or(&now).checked_add(budget).ok());
 
     let (outcome, enqueue) = match &step.action {
         Action::Shell { argv } => {
@@ -1075,7 +1093,12 @@ async fn try_run_step(ctx: &Ctx, due: &DueStep) -> Result<()> {
             // cancel that landed in the gap has already moved the cursor,
             // and one landing from here on has a handle to reach.
             let current = after_claim(ctx, due, claim, "confirming the claim of", || {
-                ctx.store.claim_is_current_checked(due.job, due.run, claim, job.approval.as_ref().map(|a| a.definition_hash))
+                ctx.store.claim_is_current_checked(
+                    due.job,
+                    due.run,
+                    claim,
+                    job.approval.as_ref().map(|a| a.definition_hash),
+                )
             })
             .await;
             if current != Some(true) {
@@ -1122,9 +1145,7 @@ async fn try_run_step(ctx: &Ctx, due: &DueStep) -> Result<()> {
             }
             let outcome = match result {
                 Ok(result) => StepOutcome {
-                    success: result.exit_code == Some(0)
-                        && !result.timed_out
-                        && !result.cancelled,
+                    success: result.exit_code == Some(0) && !result.timed_out && !result.cancelled,
                     exit_code: result.exit_code,
                     timed_out: result.timed_out,
                     stdout: result.stdout,
@@ -1164,10 +1185,7 @@ async fn try_run_step(ctx: &Ctx, due: &DueStep) -> Result<()> {
     // Whichever trigger fired — in-task timer, tick sweep, or the step
     // simply running long — the wall clock is the authority on whether the
     // budget is spent (§9).
-    if deadline_at
-        .as_ref()
-        .is_some_and(|at| ended_at >= *at)
-    {
+    if deadline_at.as_ref().is_some_and(|at| ended_at >= *at) {
         after_claim(ctx, due, claim, "ending at the deadline", || {
             end_on_deadline(ctx, &job, due, Some(attempt), &ended_at)
         })
@@ -1213,9 +1231,14 @@ fn register_live(
     kill_at: Option<Timestamp>,
     kill_grace: Duration,
 ) {
-    live.lock()
-        .expect("registry")
-        .insert((job, run, attempt), LiveAttempt { cancel, kill_at, kill_grace });
+    live.lock().expect("registry").insert(
+        (job, run, attempt),
+        LiveAttempt {
+            cancel,
+            kill_at,
+            kill_grace,
+        },
+    );
 }
 
 /// Keep process execution alive independently of the scheduler task that
@@ -1258,9 +1281,7 @@ fn cancel_live(live: &Registry, job: JobId, runs: &[RunId]) -> usize {
     let registry = live.lock().expect("registry");
     registry
         .iter()
-        .filter(|((entry_job, entry_run, _), _)| {
-            *entry_job == job && runs.contains(entry_run)
-        })
+        .filter(|((entry_job, entry_run, _), _)| *entry_job == job && runs.contains(entry_run))
         // Every live attempt of the run, not just the newest: an earlier one
         // still inside its teardown is holding a process group too.
         .map(|(_, attempt)| attempt.cancel.signal())
@@ -1275,11 +1296,7 @@ fn cancel_live(live: &Registry, job: JobId, runs: &[RunId]) -> usize {
 fn sweep_deadlines(live: &Registry, now: &Timestamp) {
     let registry = live.lock().expect("registry");
     for attempt in registry.values() {
-        if attempt
-            .kill_at
-            .as_ref()
-            .is_some_and(|at| at <= now)
-        {
+        if attempt.kill_at.as_ref().is_some_and(|at| at <= now) {
             attempt.cancel.signal();
         }
     }
@@ -1326,19 +1343,22 @@ async fn close_step(
     }
 
     let closed = store
-        .finish_step_checked(StepClose {
-            job: job.id,
-            entry_step: &job.graph.entry,
-            run,
-            step: step_id,
-            attempt,
-            ended_at,
-            exit_code: outcome.exit_code,
-            timed_out: outcome.timed_out,
-            outcome_edge: edge,
-            next: next.clone(),
-            notifications,
-        }, job.approval.as_ref().map(|a| a.definition_hash))
+        .finish_step_checked(
+            StepClose {
+                job: job.id,
+                entry_step: &job.graph.entry,
+                run,
+                step: step_id,
+                attempt,
+                ended_at,
+                exit_code: outcome.exit_code,
+                timed_out: outcome.timed_out,
+                outcome_edge: edge,
+                next: next.clone(),
+                notifications,
+            },
+            job.approval.as_ref().map(|a| a.definition_hash),
+        )
         .await?;
 
     if !closed.advanced {
@@ -1349,7 +1369,12 @@ async fn close_step(
 
     Ok(Closed {
         next: match next {
-            NextCursor::Waiting { step, at } => Some(DueStep { job: job.id, run, step, at }),
+            NextCursor::Waiting { step, at } => Some(DueStep {
+                job: job.id,
+                run,
+                step,
+                at,
+            }),
             NextCursor::Terminal { .. } => None,
         },
         // Released by the same commit that ended the run (§4.2).
@@ -1431,7 +1456,10 @@ async fn resolve_effect(
             },
             fail_reason: None,
         }),
-        Effect::Goto { step: target, after } => {
+        Effect::Goto {
+            step: target,
+            after,
+        } => {
             let target_step = job
                 .graph
                 .steps
@@ -1504,14 +1532,22 @@ async fn fire_job_task(ctx: Arc<Ctx>, job: JobId, claiming: Timestamp, retry: u3
     else {
         return;
     };
-    eprintln!("cued: internal error firing {job} (try {}): {error:#}", retry + 1);
+    eprintln!(
+        "cued: internal error firing {job} (try {}): {error:#}",
+        retry + 1
+    );
 
     let next = retry + 1;
     if next < STEP_RETRY_BUDGET {
         let delay = STEP_RETRY_BACKOFF * 2i32.saturating_pow(retry);
         if let Ok(at) = ctx.clock.now().checked_add(delay) {
             eprintln!("cued: re-arming {job}'s firing in {delay:#}");
-            let _ = ctx.arm.send(Arm::RetryFire { job, claiming, at, retry: next });
+            let _ = ctx.arm.send(Arm::RetryFire {
+                job,
+                claiming,
+                at,
+                retry: next,
+            });
             return;
         }
     }
@@ -1577,18 +1613,21 @@ pub async fn fire_job(
         // instant. Claim the instant so the job stops being armed, and
         // record no firing at all.
         store
-            .record_firing_checked(Firing {
-                job: job_id,
-                entry_step: &entry,
-                claiming: scheduled,
-                // Nothing left to spend, so nothing is spent.
-                consumed: 0,
-                run_at: None,
-                skipped: None,
-                queue_at: None,
-                next_fire_at: None,
-                now,
-            }, job.approval.as_ref().map(|a| a.definition_hash))
+            .record_firing_checked(
+                Firing {
+                    job: job_id,
+                    entry_step: &entry,
+                    claiming: scheduled,
+                    // Nothing left to spend, so nothing is spent.
+                    consumed: 0,
+                    run_at: None,
+                    skipped: None,
+                    queue_at: None,
+                    next_fire_at: None,
+                    now,
+                },
+                job.approval.as_ref().map(|a| a.definition_hash),
+            )
             .await?;
         return Ok(Vec::new());
     }
@@ -1654,29 +1693,36 @@ pub async fn fire_job(
     };
 
     let created = store
-        .record_firing_checked(Firing {
-            job: job_id,
-            entry_step: &entry,
-            // §4.2: the instant this arm is claiming. The store re-arms only
-            // if it still expects exactly this one.
-            claiming: scheduled,
-            // Every due instant this firing covers is a firing, however it
-            // ends up recorded — run, skip row, or coalesced into the queue.
-            consumed: count,
-            run_at: run_at.as_ref(),
-            skipped: skipped
-                .as_ref()
-                .map(|(from, to, n)| (from.as_ref(), to, *n)),
-            queue_at: queue_at.as_ref(),
-            next_fire_at: next.as_ref(),
-            now,
-        }, job.approval.as_ref().map(|a| a.definition_hash))
+        .record_firing_checked(
+            Firing {
+                job: job_id,
+                entry_step: &entry,
+                // §4.2: the instant this arm is claiming. The store re-arms only
+                // if it still expects exactly this one.
+                claiming: scheduled,
+                // Every due instant this firing covers is a firing, however it
+                // ends up recorded — run, skip row, or coalesced into the queue.
+                consumed: count,
+                run_at: run_at.as_ref(),
+                skipped: skipped
+                    .as_ref()
+                    .map(|(from, to, n)| (from.as_ref(), to, *n)),
+                queue_at: queue_at.as_ref(),
+                next_fire_at: next.as_ref(),
+                now,
+            },
+            job.approval.as_ref().map(|a| a.definition_hash),
+        )
         .await?;
 
     // The claim failed: this job was cancelled or paused underneath us, or
     // another heap entry for this same instant got here first. Emitting
     // arms anyway is exactly how a duplicate compounds (§4.2).
-    let Fired::Recorded { run: created, drained } = created else {
+    let Fired::Recorded {
+        run: created,
+        drained,
+    } = created
+    else {
         return Ok(Vec::new());
     };
 
@@ -1732,7 +1778,12 @@ pub async fn reconcile(store: &Store, now: &Timestamp) -> Result<Vec<Arm>> {
     // Case 1 snapshot FIRST: Case-2 handling below moves cursors to Waiting
     // (Fail-with-recovery-edge, Retry), and taking the waiting set afterward
     // would arm those runs twice — a double-spawn.
-    let mut due: Vec<Arm> = store.waiting_runs().await?.into_iter().map(Arm::Step).collect();
+    let mut due: Vec<Arm> = store
+        .waiting_runs()
+        .await?
+        .into_iter()
+        .map(Arm::Step)
+        .collect();
 
     // The recurring half of the heap (§5.3): every active job's re-arm
     // target. Overdue targets get the catch_up treatment at fire time.
@@ -1740,16 +1791,25 @@ pub async fn reconcile(store: &Store, now: &Timestamp) -> Result<Vec<Arm>> {
         due.push(Arm::Fire { job, at });
     }
 
-
     for (job_id, run, step_id) in store.interrupted_runs().await? {
         let job = store.load_job(job_id).await?;
-        if !job.approval_valid() { continue; }
+        if !job.approval_valid() {
+            continue;
+        }
         let Some(step) = job.graph.steps.get(&step_id) else {
             // Submit validated the graph, so a cursor pointing nowhere is
             // corruption — park it for a human rather than guess.
             let notify = on_hold_message(&job, &step_id, HeldReason::Interrupted);
             store
-                .hold_run(job_id, run, &step_id, HeldReason::Interrupted, &notify, now, None)
+                .hold_run(
+                    job_id,
+                    run,
+                    &step_id,
+                    HeldReason::Interrupted,
+                    &notify,
+                    now,
+                    None,
+                )
                 .await?;
             continue;
         };
@@ -1762,13 +1822,20 @@ pub async fn reconcile(store: &Store, now: &Timestamp) -> Result<Vec<Arm>> {
         };
         match policy {
             OnInterrupt::Hold => {
-                let notify = job
-                    .hooks
-                    .on_hold
-                    .clone()
-                    .unwrap_or_else(|| on_hold_message(&job, &step_id, HeldReason::Interrupted));
+                let notify =
+                    job.hooks.on_hold.clone().unwrap_or_else(|| {
+                        on_hold_message(&job, &step_id, HeldReason::Interrupted)
+                    });
                 store
-                    .hold_run(job_id, run, &step_id, HeldReason::Interrupted, &notify, now, None)
+                    .hold_run(
+                        job_id,
+                        run,
+                        &step_id,
+                        HeldReason::Interrupted,
+                        &notify,
+                        now,
+                        None,
+                    )
                     .await?;
             }
             OnInterrupt::Fail => {
@@ -1783,9 +1850,10 @@ pub async fn reconcile(store: &Store, now: &Timestamp) -> Result<Vec<Arm>> {
                     stdout: String::new(),
                     stderr: String::new(),
                 };
-                let closed =
-                    close_step(store, &job, run, &step_id, step, attempt, &outcome, None, now)
-                        .await?;
+                let closed = close_step(
+                    store, &job, run, &step_id, step, attempt, &outcome, None, now,
+                )
+                .await?;
                 due.extend(
                     [closed.next, closed.drained]
                         .into_iter()
@@ -1816,7 +1884,12 @@ pub async fn reconcile(store: &Store, now: &Timestamp) -> Result<Vec<Arm>> {
     for job in store.queued_jobs().await? {
         let entry = store.load_job(job).await?.graph.entry;
         if let Some((run, at)) = store.drain_queued(job, &entry).await? {
-            due.push(Arm::Step(DueStep { job, run, step: entry, at }));
+            due.push(Arm::Step(DueStep {
+                job,
+                run,
+                step: entry,
+                at,
+            }));
         }
     }
 
@@ -1888,7 +1961,9 @@ async fn dispatch(ctx: &Ctx, line: &str) -> Response {
         Ok(request) => request,
         Err(error) => {
             return Response::Error {
-                message: format!("bad request: {error} — client and daemon may be different builds; stop the running `cued daemon` and rerun; the next command respawns it"),
+                message: format!(
+                    "bad request: {error} — client and daemon may be different builds; stop the running `cued daemon` and rerun; the next command respawns it"
+                ),
             };
         }
     };
@@ -1901,20 +1976,40 @@ async fn dispatch(ctx: &Ctx, line: &str) -> Response {
         RequestBody::Ping => Response::Pong {
             proto: PROTO_VERSION,
         },
-        RequestBody::Submit { spec } => match handle_submit(ctx, *spec, crate::model::JobSource::Cli, false).await {
-            Ok((job, run)) => Response::Submitted { job, run, pending_approval: false },
+        RequestBody::Submit { spec } => {
+            match handle_submit(ctx, *spec, crate::model::JobSource::Cli, false).await {
+                Ok((job, run)) => Response::Submitted {
+                    job,
+                    run,
+                    pending_approval: false,
+                },
+                Err(error) => Response::Error {
+                    message: format!("{error:#}"),
+                },
+            }
+        }
+        RequestBody::SubmitDefinition {
+            spec,
+            source,
+            require_approval,
+        } => match handle_submit(ctx, *spec, source, require_approval).await {
+            Ok((job, run)) => Response::Submitted {
+                job,
+                run,
+                pending_approval: require_approval,
+            },
             Err(error) => Response::Error {
                 message: format!("{error:#}"),
             },
         },
-        RequestBody::SubmitDefinition { spec, source, require_approval } =>
-            match handle_submit(ctx, *spec, source, require_approval).await {
-                Ok((job, run)) => Response::Submitted { job, run, pending_approval: require_approval },
-                Err(error) => Response::Error { message: format!("{error:#}") },
-            },
-        RequestBody::Approve { job, definition_hash } => match handle_approve(ctx, &job, definition_hash).await {
+        RequestBody::Approve {
+            job,
+            definition_hash,
+        } => match handle_approve(ctx, &job, definition_hash).await {
             Ok(job) => Response::Approved { job },
-            Err(error) => Response::Error { message: format!("{error:#}") },
+            Err(error) => Response::Error {
+                message: format!("{error:#}"),
+            },
         },
         RequestBody::List { all } => match handle_list(ctx, all).await {
             Ok(jobs) => Response::JobList { jobs },
@@ -1978,14 +2073,17 @@ async fn dispatch(ctx: &Ctx, line: &str) -> Response {
                 message: format!("{error:#}"),
             },
         },
-        RequestBody::Logs { job, run, step, attempt } => {
-            match handle_logs(ctx, &job, run, step.as_deref(), attempt).await {
-                Ok((job, run, attempts)) => Response::LogManifest { job, run, attempts },
-                Err(error) => Response::Error {
-                    message: format!("{error:#}"),
-                },
-            }
-        }
+        RequestBody::Logs {
+            job,
+            run,
+            step,
+            attempt,
+        } => match handle_logs(ctx, &job, run, step.as_deref(), attempt).await {
+            Ok((job, run, attempts)) => Response::LogManifest { job, run, attempts },
+            Err(error) => Response::Error {
+                message: format!("{error:#}"),
+            },
+        },
     }
 }
 
@@ -2025,7 +2123,10 @@ async fn handle_logs(
 /// take.
 async fn handle_cancel(ctx: &Ctx, reference: &str) -> Result<(JobId, Vec<RunId>)> {
     let job = ctx.store.resolve_job(reference).await?;
-    let runs = ctx.store.cancel_job_with_clock(job, || ctx.clock.now()).await?;
+    let runs = ctx
+        .store
+        .cancel_job_with_clock(job, || ctx.clock.now())
+        .await?;
     let signalled = cancel_live(&ctx.live, job, &runs);
     if signalled > 0 {
         eprintln!("cued: cancel {job} — signalled {signalled} running step(s)");
@@ -2076,24 +2177,32 @@ async fn handle_retry(
     Ok((job_id, run, step))
 }
 
-async fn handle_submit(ctx: &Ctx, spec: JobSpec, source: crate::model::JobSource, require_approval: bool) -> Result<(JobId, Option<RunId>)> {
+async fn handle_submit(
+    ctx: &Ctx,
+    spec: JobSpec,
+    source: crate::model::JobSource,
+    require_approval: bool,
+) -> Result<(JobId, Option<RunId>)> {
     submit::validate(&spec)?; // the §6.3 gate, whatever the front-end
     let now = ctx.clock.now();
     let entry = spec.graph.entry.clone();
-    let (job, run, at) = ctx.store.submit_definition(&spec, &now, source, require_approval).await?;
+    let (job, run, at) = ctx
+        .store
+        .submit_definition(&spec, &now, source, require_approval)
+        .await?;
     if !require_approval {
-    let _ = ctx.arm.send(match run {
-        // One-off: its single run exists already, parked on the first
-        // sleep-edge (§3.2).
-        Some(run) => Arm::Step(DueStep {
-            job,
-            run,
-            step: entry,
-            at,
-        }),
-        // Recurring: runs are created firing by firing (§4.2).
-        None => Arm::Fire { job, at },
-    });
+        let _ = ctx.arm.send(match run {
+            // One-off: its single run exists already, parked on the first
+            // sleep-edge (§3.2).
+            Some(run) => Arm::Step(DueStep {
+                job,
+                run,
+                step: entry,
+                at,
+            }),
+            // Recurring: runs are created firing by firing (§4.2).
+            None => Arm::Fire { job, at },
+        });
     }
     let _ = ctx.nudge.send(());
     Ok((job, run))
@@ -2101,12 +2210,24 @@ async fn handle_submit(ctx: &Ctx, spec: JobSpec, source: crate::model::JobSource
 
 async fn handle_approve(ctx: &Ctx, reference: &str, hash: [u8; 32]) -> Result<JobId> {
     let id = ctx.store.resolve_job(reference).await?;
-    let (run, next) = ctx.store.approve_with_clock(id, hash, || ctx.clock.now()).await?;
-    if next.is_none() { ctx.store.finish_exhausted_jobs().await?; }
+    let (run, next) = ctx
+        .store
+        .approve_with_clock(id, hash, || ctx.clock.now())
+        .await?;
+    if next.is_none() {
+        ctx.store.finish_exhausted_jobs().await?;
+    }
     let job = ctx.store.load_job(id).await?;
-    if job.can_start() && let Some(at) = next {
+    if job.can_start()
+        && let Some(at) = next
+    {
         let arm = match run {
-            Some(run) => Arm::Step(DueStep { job: id, run, step: job.graph.entry, at }),
+            Some(run) => Arm::Step(DueStep {
+                job: id,
+                run,
+                step: job.graph.entry,
+                at,
+            }),
             None => Arm::Fire { job: id, at },
         };
         let _ = ctx.arm.send(arm);
@@ -2166,8 +2287,10 @@ async fn handle_list(ctx: &Ctx, all: bool) -> Result<Vec<JobEntry>> {
             id: overview.id,
             name: overview.name,
             status: overview.status,
-            approval: overview.approval, source: overview.source,
-            expired_at: overview.expired_at, expiry_reason: overview.expiry_reason,
+            approval: overview.approval,
+            source: overview.source,
+            expired_at: overview.expired_at,
+            expiry_reason: overview.expiry_reason,
             action: action_summary(&overview.graph),
             next_at: overview
                 .last_run
@@ -2264,16 +2387,27 @@ mod tests {
         let (job, run, attempt) = (JobId(12), RunId(7), 1);
         let cancel = Cancel::new();
         let signal = cancel.signal_handle();
-        register_live(&live, job, run, attempt, cancel.clone(), None, Duration::ZERO);
-        let ownership =
-            AttemptOwnership::new(Arc::clone(&live), job, run, attempt, cancel);
+        register_live(
+            &live,
+            job,
+            run,
+            attempt,
+            cancel.clone(),
+            None,
+            Duration::ZERO,
+        );
+        let ownership = AttemptOwnership::new(Arc::clone(&live), job, run, attempt, cancel);
 
         let task = tokio::spawn(async move {
             let _ownership = ownership;
             std::future::pending::<()>().await;
         });
         task.abort();
-        assert!(task.await.expect_err("the waiter was aborted").is_cancelled());
+        assert!(
+            task.await
+                .expect_err("the waiter was aborted")
+                .is_cancelled()
+        );
 
         assert!(live.lock().expect("registry").is_empty());
         assert!(signal.is_cancelled(), "drop must latch cancellation");
@@ -2292,7 +2426,10 @@ mod tests {
             argv: vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                format!("trap '' TERM; echo $$ > '{}'; exec sleep 300", marker.display()),
+                format!(
+                    "trap '' TERM; echo $$ > '{}'; exec sleep 300",
+                    marker.display()
+                ),
             ],
             cwd: dir.display().to_string(),
             env: std::collections::BTreeMap::new(),
@@ -2376,21 +2513,31 @@ mod tests {
         let ctx = test_context(dir.path()).await?;
         let live = Arc::clone(&ctx.live);
         let (job, run, attempt) = (JobId(10), RunId(5), 1);
-        let (cancel, request) =
-            register_long_running_attempt(dir.path(), job, run, attempt, &live);
-        let ownership =
-            AttemptOwnership::new(Arc::clone(&live), job, run, attempt, cancel);
+        let (cancel, request) = register_long_running_attempt(dir.path(), job, run, attempt, &live);
+        let ownership = AttemptOwnership::new(Arc::clone(&live), job, run, attempt, cancel);
         let task = tokio::spawn(run_registered_attempt(SystemSpawner, ownership, request));
 
         let pid = wait_for_child_pid(&dir.path().join("child-pid")).await?;
         task.abort();
-        assert!(task.await.expect_err("the waiter was aborted").is_cancelled());
-        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "test child exited before shutdown");
+        assert!(
+            task.await
+                .expect_err("the waiter was aborted")
+                .is_cancelled()
+        );
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "test child exited before shutdown"
+        );
         assert!(!live.lock().expect("registry").is_empty());
         tokio::time::timeout(Duration::from_secs(2), terminate_live_steps(&ctx))
             .await
             .expect("shutdown must wait for the supervised process cleanup");
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "shutdown left the child alive");
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "shutdown left the child alive"
+        );
         assert!(live.lock().expect("registry").is_empty());
         Ok(())
     }
@@ -2400,8 +2547,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let live = Registry::default();
         let (job, run, attempt) = (JobId(11), RunId(6), 1);
-        let (cancel, request) =
-            register_long_running_attempt(dir.path(), job, run, attempt, &live);
+        let (cancel, request) = register_long_running_attempt(dir.path(), job, run, attempt, &live);
         let (panic_tx, panic_rx) = tokio::sync::oneshot::channel::<()>();
         let task_live = Arc::clone(&live);
         let task = tokio::spawn(async move {
@@ -2444,13 +2590,24 @@ mod tests {
         // Attempt 1's task ends and cleans up after itself.
         unregister_live(&live, job, run, 1);
 
-        assert_eq!(live.lock().expect("registry").len(), 1, "only attempt 2 should remain");
-        assert_eq!(cancel_live(&live, job, &[run]), 1, "the live attempt must be reachable");
+        assert_eq!(
+            live.lock().expect("registry").len(),
+            1,
+            "only attempt 2 should remain"
+        );
+        assert_eq!(
+            cancel_live(&live, job, &[run]),
+            1,
+            "the live attempt must be reachable"
+        );
         assert!(
             replacement_handle.is_cancelled(),
             "cancel must reach the replacement's process"
         );
-        assert!(!dying_handle.is_cancelled(), "the departed attempt needs no second signal");
+        assert!(
+            !dying_handle.is_cancelled(),
+            "the departed attempt needs no second signal"
+        );
     }
 
     /// And while both are alive, a cancel reaches both: the one still inside
@@ -2473,7 +2630,10 @@ mod tests {
         let other_handle = other.signal_handle();
         register_live(&live, job, RunId(2), 1, other, None, Duration::ZERO);
         cancel_live(&live, job, &[run]);
-        assert!(!other_handle.is_cancelled(), "an unrelated run must not be signalled");
+        assert!(
+            !other_handle.is_cancelled(),
+            "an unrelated run must not be signalled"
+        );
     }
 
     fn outcome(exit_code: Option<i32>, timed_out: bool) -> StepOutcome {
@@ -2495,17 +2655,27 @@ mod tests {
         step.transitions = vec![
             Transition {
                 when: Condition::ExitEq(3),
-                then: Effect::End { outcome: Outcome::Failure },
+                then: Effect::End {
+                    outcome: Outcome::Failure,
+                },
             },
             Transition {
                 when: Condition::Always,
-                then: Effect::Goto { step: "next".into(), after: None },
+                then: Effect::Goto {
+                    step: "next".into(),
+                    after: None,
+                },
             },
         ];
 
         let (edge, effect) = choose_edge(&step, &outcome(Some(3), false));
         assert_eq!(edge, Some(0));
-        assert!(matches!(effect, Effect::End { outcome: Outcome::Failure }));
+        assert!(matches!(
+            effect,
+            Effect::End {
+                outcome: Outcome::Failure
+            }
+        ));
 
         let (edge, effect) = choose_edge(&step, &outcome(Some(0), false));
         assert_eq!(edge, Some(1), "ExitEq(3) skipped, Always caught");
@@ -2520,12 +2690,26 @@ mod tests {
             .unwrap();
         let (edge, effect) = choose_edge(&step, &outcome(Some(0), false));
         assert_eq!(edge, None);
-        assert!(matches!(effect, Effect::End { outcome: Outcome::Success }));
+        assert!(matches!(
+            effect,
+            Effect::End {
+                outcome: Outcome::Success
+            }
+        ));
 
         // §3.2: nonzero exit, timeout, and death-by-signal all derive Failure.
-        for failed in [outcome(Some(2), false), outcome(Some(0), true), outcome(None, false)] {
+        for failed in [
+            outcome(Some(2), false),
+            outcome(Some(0), true),
+            outcome(None, false),
+        ] {
             let (_, effect) = choose_edge(&step, &failed);
-            assert!(matches!(effect, Effect::End { outcome: Outcome::Failure }));
+            assert!(matches!(
+                effect,
+                Effect::End {
+                    outcome: Outcome::Failure
+                }
+            ));
         }
     }
 

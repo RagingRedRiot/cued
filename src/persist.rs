@@ -131,8 +131,7 @@ impl PersistenceBackend for SystemdUser {
     fn install(&self, exe: &Path) -> Result<Vec<String>> {
         let path = unit_path()?;
         let dir = path.parent().expect("unit path has a parent");
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         std::fs::write(&path, unit_text(exe))
             .with_context(|| format!("writing {}", path.display()))?;
 
@@ -164,10 +163,12 @@ impl PersistenceBackend for SystemdUser {
         // Disable before removing the file, or systemd has nothing to read.
         if path.exists() {
             let _ = systemctl(&["--user", "disable", "--now", UNIT_NAME]);
-            std::fs::remove_file(&path)
-                .with_context(|| format!("removing {}", path.display()))?;
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
             let _ = systemctl(&["--user", "daemon-reload"]);
-            notes.push(format!("disabled {UNIT_NAME} and removed {}", path.display()));
+            notes.push(format!(
+                "disabled {UNIT_NAME} and removed {}",
+                path.display()
+            ));
         }
         // Linger is deliberately left alone: it is a grant on the user
         // account, not something cued owns, and other user services may be
@@ -236,8 +237,7 @@ fn unit_text(exe: &Path) -> String {
 fn unit_path() -> Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
-            .join(".config"),
+        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".config"),
     };
     Ok(unit_path_in(&base))
 }
@@ -626,7 +626,10 @@ mod tests {
             );
             // Still installable — the user may know their host better than
             // our probe does; they just shouldn't be told it's guaranteed.
-            assert!(availability.is_available(), "{unproven:?} should stay offerable");
+            assert!(
+                availability.is_available(),
+                "{unproven:?} should stay offerable"
+            );
         }
     }
 
@@ -650,7 +653,10 @@ mod tests {
         );
 
         let tab = crontab_with_entry("", spacey);
-        assert!(tab.contains("@reboot '/home/riot/my apps/cued' daemon"), "{tab}");
+        assert!(
+            tab.contains("@reboot '/home/riot/my apps/cued' daemon"),
+            "{tab}"
+        );
     }
 
     /// The characters each format treats specially, which are not the same
@@ -661,14 +667,26 @@ mod tests {
         // systemd: the quoting layer needs backslash and double-quote
         // escaped, and `%` doubles because specifier expansion runs first.
         assert_eq!(systemd_quote(Path::new("/opt/cued")), r#""/opt/cued""#);
-        assert_eq!(systemd_quote(Path::new("/opt/100%/cued")), r#""/opt/100%%/cued""#);
-        assert_eq!(systemd_quote(Path::new(r#"/opt/a"b/cued"#)), r#""/opt/a\"b/cued""#);
+        assert_eq!(
+            systemd_quote(Path::new("/opt/100%/cued")),
+            r#""/opt/100%%/cued""#
+        );
+        assert_eq!(
+            systemd_quote(Path::new(r#"/opt/a"b/cued"#)),
+            r#""/opt/a\"b/cued""#
+        );
 
         // cron: shell single-quoting, then `%` escaped for cron itself —
         // cron eats the backslash before `sh` ever sees the token.
         assert_eq!(cron_quote(Path::new("/opt/cued")), "'/opt/cued'");
-        assert_eq!(cron_quote(Path::new("/opt/100%/cued")), r"'/opt/100\%/cued'");
-        assert_eq!(cron_quote(Path::new("/opt/it's/cued")), r"'/opt/it'\''s/cued'");
+        assert_eq!(
+            cron_quote(Path::new("/opt/100%/cued")),
+            r"'/opt/100\%/cued'"
+        );
+        assert_eq!(
+            cron_quote(Path::new("/opt/it's/cued")),
+            r"'/opt/it'\''s/cued'"
+        );
     }
 
     /// Whatever the path, the block we write into somebody's crontab must
@@ -680,8 +698,15 @@ mod tests {
         let tab = crontab_with_entry(existing, nasty);
 
         assert_eq!(tab.lines().filter(|l| l.starts_with("@reboot")).count(), 1);
-        assert!(tab.starts_with(existing), "somebody else's job was disturbed");
-        assert_eq!(crontab_without_entry(&tab), existing, "teardown must be exact");
+        assert!(
+            tab.starts_with(existing),
+            "somebody else's job was disturbed"
+        );
+        assert_eq!(
+            crontab_without_entry(&tab),
+            existing,
+            "teardown must be exact"
+        );
     }
 
     #[test]
@@ -698,7 +723,10 @@ mod tests {
         // §5.2: systemd captures stderr, so the daemon must not also be
         // redirecting it into its own log file.
         assert!(text.contains(r#"ExecStart="/usr/local/bin/cued" daemon --foreground"#));
-        assert!(text.contains("Restart=on-failure"), "supervision is the point");
+        assert!(
+            text.contains("Restart=on-failure"),
+            "supervision is the point"
+        );
         assert!(text.contains("WantedBy=default.target"));
     }
 }

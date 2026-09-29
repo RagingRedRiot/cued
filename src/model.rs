@@ -96,7 +96,10 @@ impl JobStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ApprovalState { Pending, Approved }
+pub enum ApprovalState {
+    Pending,
+    Approved,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Approval {
@@ -107,34 +110,55 @@ pub struct Approval {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum JobSource { #[default] Cli, Mcp }
+pub enum JobSource {
+    #[default]
+    Cli,
+    Mcp,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExpiryReason { ScheduledAtPassed, ApprovalTtlElapsed }
+pub enum ExpiryReason {
+    ScheduledAtPassed,
+    ApprovalTtlElapsed,
+}
 
 pub const PENDING_APPROVAL_TTL: SignedDuration = SignedDuration::from_hours(7 * 24);
 
 impl Job {
     pub fn definition(&self) -> JobSpec {
         JobSpec {
-            name: self.name.clone(), schedule: self.schedule.clone(), graph: self.graph.clone(),
-            cwd: self.cwd.clone(), env: self.env.clone(), policies: self.policies.clone(),
+            name: self.name.clone(),
+            schedule: self.schedule.clone(),
+            graph: self.graph.clone(),
+            cwd: self.cwd.clone(),
+            env: self.env.clone(),
+            policies: self.policies.clone(),
             hooks: self.hooks.clone(),
         }
     }
 
     pub fn approval_valid(&self) -> bool {
-        self.approval.as_ref().is_none_or(|a| a.state == ApprovalState::Approved
-            && self.definition().definition_hash().is_ok_and(|hash| hash == a.definition_hash))
+        self.approval.as_ref().is_none_or(|a| {
+            a.state == ApprovalState::Approved
+                && self
+                    .definition()
+                    .definition_hash()
+                    .is_ok_and(|hash| hash == a.definition_hash)
+        })
     }
 
-    pub fn can_start(&self) -> bool { self.status == JobStatus::Active && self.approval_valid() }
+    pub fn can_start(&self) -> bool {
+        self.status == JobStatus::Active && self.approval_valid()
+    }
 
     pub fn approval_deadline(&self) -> anyhow::Result<(Timestamp, ExpiryReason)> {
         Ok(match self.schedule {
             Schedule::Once { at } => (at, ExpiryReason::ScheduledAtPassed),
-            _ => (self.created_at.checked_add(PENDING_APPROVAL_TTL)?, ExpiryReason::ApprovalTtlElapsed),
+            _ => (
+                self.created_at.checked_add(PENDING_APPROVAL_TTL)?,
+                ExpiryReason::ApprovalTtlElapsed,
+            ),
         })
     }
 
@@ -146,7 +170,9 @@ impl Job {
 pub fn display_status(status: JobStatus, approval: Option<&Approval>) -> String {
     let lifecycle = format!("{status:?}").to_lowercase();
     match approval.map(|a| a.state) {
-        Some(ApprovalState::Pending) if status.is_live() => format!("Pending approval ({lifecycle})"),
+        Some(ApprovalState::Pending) if status.is_live() => {
+            format!("Pending approval ({lifecycle})")
+        }
         Some(ApprovalState::Approved) => format!("{lifecycle} (approved)"),
         _ => lifecycle,
     }
@@ -517,11 +543,20 @@ pub enum RunStatus {
 #[serde(rename_all = "snake_case")]
 pub enum Cursor {
     /// Between steps; safe to resume eagerly (§3.4 Case 1).
-    Waiting { step: StepId, at: Timestamp },
+    Waiting {
+        step: StepId,
+        at: Timestamp,
+    },
     /// Found at startup = killed mid-run; side effects unknown (§3.4 Case 2).
-    Running { step: StepId, started_at: Timestamp },
+    Running {
+        step: StepId,
+        started_at: Timestamp,
+    },
     /// Awaiting manual `cued continue` / `cued retry`.
-    Held { step: StepId, reason: HeldReason },
+    Held {
+        step: StepId,
+        reason: HeldReason,
+    },
     Done,
 }
 

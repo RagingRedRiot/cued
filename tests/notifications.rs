@@ -29,10 +29,7 @@ impl Scripted {
 }
 
 impl Notifier for Scripted {
-    fn deliver(
-        &self,
-        spec: &NotifySpec,
-    ) -> impl std::future::Future<Output = Result<bool>> + Send {
+    fn deliver(&self, spec: &NotifySpec) -> impl std::future::Future<Output = Result<bool>> + Send {
         let outcome = {
             let mut script = self.script.lock().expect("script");
             if script.is_empty() {
@@ -95,7 +92,13 @@ async fn delivers_oldest_first_and_marks_rows() -> Result<()> {
     let (_dir, store) = store_with_queue(&["first", "second", "third"]).await?;
     let notifier = Scripted::new(vec![]); // everything succeeds
 
-    let delivered = deliver_pending(&store, &notifier, &mut DeliveryLedger::default(), &Timestamp::now()).await?;
+    let delivered = deliver_pending(
+        &store,
+        &notifier,
+        &mut DeliveryLedger::default(),
+        &Timestamp::now(),
+    )
+    .await?;
 
     assert_eq!(delivered, 3);
     assert_eq!(
@@ -112,14 +115,33 @@ async fn no_bus_leaves_the_whole_queue() -> Result<()> {
     let (_dir, store) = store_with_queue(&["a", "b"]).await?;
     let notifier = Scripted::new(vec![Ok(false)]); // §3.5: no bus right now
 
-    let delivered = deliver_pending(&store, &notifier, &mut DeliveryLedger::default(), &Timestamp::now()).await?;
+    let delivered = deliver_pending(
+        &store,
+        &notifier,
+        &mut DeliveryLedger::default(),
+        &Timestamp::now(),
+    )
+    .await?;
 
     assert_eq!(delivered, 0);
-    assert_eq!(undelivered_titles(&store).await, vec!["a", "b"], "late beats lost");
+    assert_eq!(
+        undelivered_titles(&store).await,
+        vec!["a", "b"],
+        "late beats lost"
+    );
 
     // The bus appears (next login) → the same rows land on the next pass.
     let retry = Scripted::new(vec![]);
-    assert_eq!(deliver_pending(&store, &retry, &mut DeliveryLedger::default(), &Timestamp::now()).await?, 2);
+    assert_eq!(
+        deliver_pending(
+            &store,
+            &retry,
+            &mut DeliveryLedger::default(),
+            &Timestamp::now()
+        )
+        .await?,
+        2
+    );
     assert!(undelivered_titles(&store).await.is_empty());
     Ok(())
 }
@@ -129,9 +151,19 @@ async fn a_poisoned_row_does_not_dam_the_queue() -> Result<()> {
     let (_dir, store) = store_with_queue(&["bad", "good"]).await?;
     let notifier = Scripted::new(vec![Err(anyhow!("server rejected it")), Ok(true)]);
 
-    let delivered = deliver_pending(&store, &notifier, &mut DeliveryLedger::default(), &Timestamp::now()).await?;
+    let delivered = deliver_pending(
+        &store,
+        &notifier,
+        &mut DeliveryLedger::default(),
+        &Timestamp::now(),
+    )
+    .await?;
 
     assert_eq!(delivered, 1, "the failure is skipped, not fatal");
-    assert_eq!(undelivered_titles(&store).await, vec!["bad"], "stays queued for retry");
+    assert_eq!(
+        undelivered_titles(&store).await,
+        vec!["bad"],
+        "stays queued for retry"
+    );
     Ok(())
 }

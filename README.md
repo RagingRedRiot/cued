@@ -165,6 +165,19 @@ cargo test --release
 cargo clippy --release --all-targets -- -D warnings
 ```
 
+The cross-user access test (DESIGN.md §7.1) needs Docker. It runs the daemon
+as two real UIDs in a locked-down container and checks that the owner is served
+and the other user is refused:
+
+```sh
+cargo build --locked && scripts/security/run.sh target/debug/cued
+```
+
+CI runs it with fmt, clippy and the test suite (`.github/workflows/ci.yml`).
+`controls.yml` fails a pull request that changes workflows, the access fixture,
+or existing tests, until a maintainer applies the `reviewed-controls` label to
+that revision.
+
 The optional `test-hooks` feature enables fault injection for tests. Leave it off
 in installations used for real jobs.
 
