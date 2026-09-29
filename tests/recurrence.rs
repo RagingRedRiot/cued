@@ -48,13 +48,11 @@ async fn temp_store() -> Result<(tempfile::TempDir, Store)> {
 }
 
 async fn runs_table(store: &Store, job: JobId) -> Vec<(i64, String, Option<i64>)> {
-    sqlx::query_as(
-        "SELECT id, status, skipped_count FROM runs WHERE job_id = ? ORDER BY id",
-    )
-    .bind(job.0)
-    .fetch_all(store.pool())
-    .await
-    .expect("runs")
+    sqlx::query_as("SELECT id, status, skipped_count FROM runs WHERE job_id = ? ORDER BY id")
+        .bind(job.0)
+        .fetch_all(store.pool())
+        .await
+        .expect("runs")
 }
 
 async fn job_row(store: &Store, job: JobId) -> (String, Option<String>, Option<String>) {
@@ -73,7 +71,10 @@ async fn complete_run(
     run: cued::model::RunId,
     now: &Timestamp,
 ) -> Result<Option<(cued::model::RunId, Timestamp)>> {
-    let attempt = store.begin_step(job, run, "run", now).await?.expect("claim");
+    let attempt = store
+        .begin_step(job, run, "run", now)
+        .await?
+        .expect("claim");
     let closed = store
         .finish_step(StepClose {
             job,
@@ -100,15 +101,15 @@ async fn recurring_submit_sets_next_fire_and_no_run() -> Result<()> {
     let (_dir, store) = temp_store().await?;
     let now = Timestamp::now();
     let (job, run, first) = store
-        .submit_job(&every_spec("r", 60, now, CatchUp::RunOnce, Overlap::Skip, None), &now)
+        .submit_job(
+            &every_spec("r", 60, now, CatchUp::RunOnce, Overlap::Skip, None),
+            &now,
+        )
         .await?;
 
     assert!(run.is_none(), "recurring jobs get runs firing by firing");
     // Anchor == submit time → first firing one interval later (strictly after).
-    assert_eq!(
-        first,
-        now.checked_add(SignedDuration::from_secs(60))?
-    );
+    assert_eq!(first, now.checked_add(SignedDuration::from_secs(60))?);
     let (status, next, queued) = job_row(&store, job).await;
     assert_eq!(status, "active");
     assert!(next.is_some());
@@ -186,7 +187,10 @@ async fn overlap_skip_records_and_queue_drains_after_the_run() -> Result<()> {
 
     // --- Skip (default): the firing becomes a Skipped row.
     let (skip_job, _, first) = store
-        .submit_job(&every_spec("s", 60, now, CatchUp::RunOnce, Overlap::Skip, None), &now)
+        .submit_job(
+            &every_spec("s", 60, now, CatchUp::RunOnce, Overlap::Skip, None),
+            &now,
+        )
         .await?;
     fire_job(&store, skip_job, &first, &first).await?; // on time → live run 1
     let second = first.checked_add(SignedDuration::from_secs(60))?;
@@ -198,7 +202,10 @@ async fn overlap_skip_records_and_queue_drains_after_the_run() -> Result<()> {
 
     // --- Queue: the firing parks in the slot; further ones coalesce.
     let (queue_job, _, first) = store
-        .submit_job(&every_spec("q", 60, now, CatchUp::RunOnce, Overlap::Queue, None), &now)
+        .submit_job(
+            &every_spec("q", 60, now, CatchUp::RunOnce, Overlap::Queue, None),
+            &now,
+        )
         .await?;
     fire_job(&store, queue_job, &first, &first).await?; // live run 1
     let second = first.checked_add(SignedDuration::from_secs(60))?;
@@ -207,7 +214,11 @@ async fn overlap_skip_records_and_queue_drains_after_the_run() -> Result<()> {
     fire_job(&store, queue_job, &third, &third).await?; // coalesces over `second`
     let (_, _, queued) = job_row(&store, queue_job).await;
     assert!(queued.is_some(), "one pending firing held");
-    assert_eq!(runs_table(&store, queue_job).await.len(), 1, "no skip rows, no second run");
+    assert_eq!(
+        runs_table(&store, queue_job).await.len(),
+        1,
+        "no skip rows, no second run"
+    );
 
     // The live run ends → the queued firing becomes run 2, released by the
     // very commit that ended run 1 rather than by a second call after it
@@ -253,10 +264,16 @@ async fn pause_stops_firing_and_resume_rearms_forward() -> Result<()> {
     let (_dir, store) = temp_store().await?;
     let now = Timestamp::now();
     let (job, _, first) = store
-        .submit_job(&every_spec("p", 60, now, CatchUp::RunOnce, Overlap::Skip, None), &now)
+        .submit_job(
+            &every_spec("p", 60, now, CatchUp::RunOnce, Overlap::Skip, None),
+            &now,
+        )
         .await?;
 
-    assert!(store.set_resumed(job, None, &now).await.is_err(), "not paused yet");
+    assert!(
+        store.set_resumed(job, None, &now).await.is_err(),
+        "not paused yet"
+    );
     store.set_paused(job).await?;
     assert!(store.set_paused(job).await.is_err(), "already paused");
 
@@ -282,7 +299,12 @@ async fn pause_stops_firing_and_resume_rearms_forward() -> Result<()> {
 /// An `Every` schedule carrying `until` (§4.1). Separate from `every_spec`
 /// because the interaction between a bounded sequence and catch-up is
 /// exactly what the two tests below pin down.
-fn every_until_spec(name: &str, interval_secs: i64, anchor: Timestamp, until: Timestamp) -> JobSpec {
+fn every_until_spec(
+    name: &str,
+    interval_secs: i64,
+    anchor: Timestamp,
+    until: Timestamp,
+) -> JobSpec {
     JobSpec {
         name: Some(name.into()),
         schedule: Schedule::Every {
@@ -338,7 +360,10 @@ async fn every_with_until_survives_a_long_outage() -> Result<()> {
     // Still alive: re-armed forward, with the run armed too.
     let (status, next, _) = job_row(&store, job).await;
     assert_eq!(status, "active");
-    assert!(next.is_some(), "the job must re-arm, not die on the catch-up");
+    assert!(
+        next.is_some(),
+        "the job must re-arm, not die on the catch-up"
+    );
     assert!(arms.iter().any(|a| matches!(a, Arm::Fire { .. })));
     Ok(())
 }
@@ -403,7 +428,10 @@ async fn cancel_stops_recurring_and_drops_the_queued_firing() -> Result<()> {
     assert!(next.is_none(), "cancel stops re-arming");
     assert!(queued.is_none(), "a queued firing must not outlive the job");
     assert!(
-        runs_table(&store, job).await.iter().all(|(_, s, _)| s != "pending"),
+        runs_table(&store, job)
+            .await
+            .iter()
+            .all(|(_, s, _)| s != "pending"),
         "no run should still be live"
     );
 
@@ -461,13 +489,19 @@ async fn log_manifest_resolves_past_runs_that_never_ran() -> Result<()> {
     let second = first.checked_add(SignedDuration::from_secs(60))?;
     fire_job(&store, job, &second, &second).await?;
     let run2 = cued::model::RunId(2);
-    store.begin_step(job, run2, "run", &second).await?.expect("claim");
+    store
+        .begin_step(job, run2, "run", &second)
+        .await?
+        .expect("claim");
 
     // Run 2 is still live, so firing 3 becomes a Skipped row (overlap=Skip).
     let third = first.checked_add(SignedDuration::from_secs(120))?;
     fire_job(&store, job, &third, &third).await?;
     let rows = runs_table(&store, job).await;
-    assert_eq!(rows.last().map(|(_, status, _)| status.as_str()), Some("skipped"));
+    assert_eq!(
+        rows.last().map(|(_, status, _)| status.as_str()),
+        Some("skipped")
+    );
 
     // The newest row is the skip; the manifest must land on run 2.
     let (resolved, attempts) = store.log_manifest(job, None, None, None).await?;
@@ -519,8 +553,13 @@ async fn two_arms_for_one_instant_fire_once() -> Result<()> {
     assert_eq!(rows.len(), 1, "one instant, one run: {rows:?}");
 
     // And exactly one Fire arm went out, so the next cycle has one entry.
-    let fires = a.iter().filter(|arm| matches!(arm, Arm::Fire { .. })).count()
-        + b.iter().filter(|arm| matches!(arm, Arm::Fire { .. })).count();
+    let fires = a
+        .iter()
+        .filter(|arm| matches!(arm, Arm::Fire { .. }))
+        .count()
+        + b.iter()
+            .filter(|arm| matches!(arm, Arm::Fire { .. }))
+            .count();
     assert_eq!(fires, 1, "the heap must not grow an entry per duplicate");
     Ok(())
 }
@@ -569,10 +608,16 @@ async fn a_cancel_landing_mid_fire_is_not_undone() -> Result<()> {
     );
     let (status, next_at, queued) = job_row(&store, job).await;
     assert_eq!(status, "cancelled");
-    assert!(next_at.is_none(), "the firing reinstated next_fire_at on a cancelled job");
+    assert!(
+        next_at.is_none(),
+        "the firing reinstated next_fire_at on a cancelled job"
+    );
     assert!(queued.is_none());
     assert!(
-        runs_table(&store, job).await.iter().all(|(_, s, _)| s == "cancelled"),
+        runs_table(&store, job)
+            .await
+            .iter()
+            .all(|(_, s, _)| s == "cancelled"),
         "the firing left a live run behind on a cancelled job"
     );
 
@@ -653,7 +698,14 @@ async fn catch_up_cannot_spend_more_than_the_count_budget() -> Result<()> {
     let anchor = now.checked_sub(SignedDuration::from_secs(601))?;
     let (job, _, first) = store
         .submit_job(
-            &every_spec("capped", 60, anchor, CatchUp::RunOnce, Overlap::Skip, Some(3)),
+            &every_spec(
+                "capped",
+                60,
+                anchor,
+                CatchUp::RunOnce,
+                Overlap::Skip,
+                Some(3),
+            ),
             &anchor,
         )
         .await?;
@@ -661,8 +713,14 @@ async fn catch_up_cannot_spend_more_than_the_count_budget() -> Result<()> {
     fire_job(&store, job, &first, &now).await?;
 
     let rows = runs_table(&store, job).await;
-    let recorded: i64 = rows.iter().map(|(_, _, skipped)| skipped.unwrap_or(1)).sum();
-    assert_eq!(recorded, 3, "the budget was 3 firings, spent {recorded}: {rows:?}");
+    let recorded: i64 = rows
+        .iter()
+        .map(|(_, _, skipped)| skipped.unwrap_or(1))
+        .sum();
+    assert_eq!(
+        recorded, 3,
+        "the budget was 3 firings, spent {recorded}: {rows:?}"
+    );
 
     // RunOnce still does its job *within* the budget: the earlier instants
     // compact into one skip row and the last of the three runs.
@@ -679,11 +737,7 @@ async fn catch_up_cannot_spend_more_than_the_count_budget() -> Result<()> {
     .fetch_one(store.pool())
     .await?;
     let third = anchor.checked_add(SignedDuration::from_secs(180))?;
-    assert_eq!(
-        ran,
-        third.to_string(),
-        "ran an instant past the budget"
-    );
+    assert_eq!(ran, third.to_string(), "ran an instant past the budget");
 
     // §4.1: budget spent, so nothing is re-armed.
     let (_, next, _) = job_row(&store, job).await;
@@ -714,7 +768,10 @@ async fn a_firing_with_no_budget_left_records_nothing() -> Result<()> {
     // A stale arm for a later instant arrives anyway.
     let second = first.checked_add(SignedDuration::from_secs(60))?;
     let arms = fire_job(&store, job, &second, &second).await?;
-    assert!(arms.is_empty(), "an exhausted job must not re-arm: {arms:?}");
+    assert!(
+        arms.is_empty(),
+        "an exhausted job must not re-arm: {arms:?}"
+    );
     assert_eq!(
         runs_table(&store, job).await.len(),
         1,
@@ -741,7 +798,11 @@ async fn an_uncapped_schedule_still_catches_up_over_the_whole_range() -> Result<
     fire_job(&store, job, &first, &now).await?;
 
     let rows = runs_table(&store, job).await;
-    assert_eq!(rows[0].2, Some(9), "all nine earlier instants compact: {rows:?}");
+    assert_eq!(
+        rows[0].2,
+        Some(9),
+        "all nine earlier instants compact: {rows:?}"
+    );
     let (_, next, _) = job_row(&store, job).await;
     assert!(next.is_some(), "an uncapped schedule keeps going");
     Ok(())
@@ -763,7 +824,10 @@ async fn every_terminal_path_releases_the_queue_except_held() -> Result<()> {
     fire_job(&store, job, &first, &first).await?;
     let second = first.checked_add(SignedDuration::from_secs(60))?;
     fire_job(&store, job, &second, &second).await?;
-    assert!(job_row(&store, job).await.2.is_some(), "slot should be filled");
+    assert!(
+        job_row(&store, job).await.2.is_some(),
+        "slot should be filled"
+    );
 
     // End run 1 the way `missed_wait = Abandon` does.
     // The release now rides the same commit that ends the run — there is no
@@ -788,14 +852,20 @@ async fn every_terminal_path_releases_the_queue_except_held() -> Result<()> {
     let second = first.checked_add(SignedDuration::from_secs(60))?;
     fire_job(&store, job, &second, &second).await?;
 
-    store.begin_step(job, cued::model::RunId(1), "run", &first).await?.expect("claim");
+    store
+        .begin_step(job, cued::model::RunId(1), "run", &first)
+        .await?
+        .expect("claim");
     store
         .hold_run(
             job,
             cued::model::RunId(1),
             "run",
             cued::model::HeldReason::Interrupted,
-            &cued::model::NotifySpec { title: "t".into(), body: "b".into() },
+            &cued::model::NotifySpec {
+                title: "t".into(),
+                body: "b".into(),
+            },
             &second,
             None,
         )
@@ -828,7 +898,10 @@ async fn reconcile_drains_after_it_has_finished_ending_runs() -> Result<()> {
     assert!(job_row(&store, job).await.2.is_some(), "slot filled");
 
     // Leave run 1 as a crash leaves it: cursor Running, no daemon.
-    store.begin_step(job, cued::model::RunId(1), "run", &first).await?.expect("claim");
+    store
+        .begin_step(job, cued::model::RunId(1), "run", &first)
+        .await?
+        .expect("claim");
 
     let arms = cued::daemon::reconcile(&store, &second).await?;
 
@@ -873,7 +946,11 @@ async fn retry_neither_targets_a_skipped_row_nor_makes_a_second_live_run() -> Re
 
     // "The latest run" must mean run 1, not the skip record.
     let (target, _, _) = store.latest_run_cursor(job).await?;
-    assert_eq!(target, cued::model::RunId(1), "retry aimed at the skipped firing");
+    assert_eq!(
+        target,
+        cued::model::RunId(1),
+        "retry aimed at the skipped firing"
+    );
 
     // Run 1 is still live, so retrying it must be refused rather than
     // silently producing a second live run.
@@ -893,7 +970,11 @@ async fn retry_neither_targets_a_skipped_row_nor_makes_a_second_live_run() -> Re
         .to_string();
     assert!(error.contains("still live"), "{error}");
     assert_eq!(
-        runs_table(&store, job).await.iter().filter(|(_, s, _)| s == "pending").count(),
+        runs_table(&store, job)
+            .await
+            .iter()
+            .filter(|(_, s, _)| s == "pending")
+            .count(),
         1,
         "a job runs one at a time (§4.2)"
     );
@@ -917,14 +998,21 @@ async fn retry_still_works_once_nothing_is_live() -> Result<()> {
 
     // A skip row after it, so targeting has to step past that too.
     let second = first.checked_add(SignedDuration::from_secs(60))?;
-    store.begin_step(job, cued::model::RunId(1), "run", &first).await.ok();
+    store
+        .begin_step(job, cued::model::RunId(1), "run", &first)
+        .await
+        .ok();
     let (target, kind, _) = store.latest_run_cursor(job).await?;
     assert_eq!(target, cued::model::RunId(1));
     assert_eq!(kind, "done");
 
     store.rewind_run(job, target, "run", &second).await?;
     let rows = runs_table(&store, job).await;
-    assert_eq!(rows.len(), 1, "retry rewinds in place — same run, not a new one");
+    assert_eq!(
+        rows.len(),
+        1,
+        "retry rewinds in place — same run, not a new one"
+    );
     assert_eq!(rows[0].1, "pending", "the rewound run is runnable again");
     Ok(())
 }
@@ -997,11 +1085,17 @@ async fn the_firing_budget_survives_garbage_collection() -> Result<()> {
     // §10.2's own sweep, not a hand-rolled delete, so this is the real path.
     let swept = store
         .gc(
-            &cued::config::Retention { days: 3650, runs_per_job: 0 },
+            &cued::config::Retention {
+                days: 3650,
+                runs_per_job: 0,
+            },
             &first.checked_add(SignedDuration::from_secs(60))?,
         )
         .await?;
-    assert!(!swept.runs.is_empty(), "the sweep should have pruned the run");
+    assert!(
+        !swept.runs.is_empty(),
+        "the sweep should have pruned the run"
+    );
 
     assert_eq!(
         store.fired_count(job).await?,
@@ -1034,16 +1128,32 @@ async fn pausing_freezes_the_queue_and_resuming_drops_it() -> Result<()> {
     // Claim while active: pause lets an already-running step finish, but the
     // durable start gate correctly rejects a new claim after the pause.
     let run = cued::model::RunId(1);
-    let attempt = store.begin_step(job, run, "run", &second).await?.expect("claim");
+    let attempt = store
+        .begin_step(job, run, "run", &second)
+        .await?
+        .expect("claim");
     store.set_paused(job).await?;
 
     // Ending the live run must NOT mint a run from the slot while paused.
-    let drained = store.finish_step(StepClose {
-        job, entry_step: "run", run, step: "run", attempt, ended_at: &second,
-        exit_code: Some(0), timed_out: false, outcome_edge: None,
-        next: NextCursor::Terminal { status: RunStatus::Done, fail_reason: None },
-        notifications: Vec::new(),
-    }).await?.drained;
+    let drained = store
+        .finish_step(StepClose {
+            job,
+            entry_step: "run",
+            run,
+            step: "run",
+            attempt,
+            ended_at: &second,
+            exit_code: Some(0),
+            timed_out: false,
+            outcome_edge: None,
+            next: NextCursor::Terminal {
+                status: RunStatus::Done,
+                fail_reason: None,
+            },
+            notifications: Vec::new(),
+        })
+        .await?
+        .drained;
     assert!(drained.is_none(), "a paused job drained its queue anyway");
     assert!(
         job_row(&store, job).await.2.is_some(),
@@ -1058,7 +1168,10 @@ async fn pausing_freezes_the_queue_and_resuming_drops_it() -> Result<()> {
         "resume back-filled the queued firing"
     );
     assert!(
-        runs_table(&store, job).await.iter().all(|(_, s, _)| s != "pending"),
+        runs_table(&store, job)
+            .await
+            .iter()
+            .all(|(_, s, _)| s != "pending"),
         "no past occurrence should be waiting to run after a resume"
     );
     Ok(())

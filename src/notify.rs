@@ -67,10 +67,7 @@ pub enum Delivery {
 /// never fail a run (§3.2). Spelled as an explicit `impl Future + Send`
 /// (not `async fn`) because the delivery task is `tokio::spawn`ed generically.
 pub trait Notifier: Send + Sync {
-    fn deliver(
-        &self,
-        spec: &NotifySpec,
-    ) -> impl std::future::Future<Output = Result<bool>> + Send;
+    fn deliver(&self, spec: &NotifySpec) -> impl std::future::Future<Output = Result<bool>> + Send;
 
     /// Deliver queue row `key` (never reused). A transport that can tell
     /// "no answer yet" from "failed" keeps the call and answers `Awaiting`
@@ -134,7 +131,11 @@ impl DesktopNotifier {
     /// `address` pins the bus (tests: a private one) instead of the §3.5
     /// resolution; the limits are the inline acknowledgement wait and how
     /// long an overdue call holds its row.
-    pub fn with_limits(address: Option<String>, ack_wait: Duration, abandon_after: Duration) -> Self {
+    pub fn with_limits(
+        address: Option<String>,
+        ack_wait: Duration,
+        abandon_after: Duration,
+    ) -> Self {
         Self {
             address,
             ack_wait,
@@ -149,7 +150,9 @@ impl DesktopNotifier {
     }
 
     fn overdue(&self) -> std::sync::MutexGuard<'_, HashMap<i64, Overdue>> {
-        self.overdue.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.overdue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Settle what an earlier call for `key` left behind. `Some` answers the
@@ -241,7 +244,13 @@ impl Notifier for DesktopNotifier {
                     }
                     keep
                 });
-                overdue.insert(key, Overdue { since: Instant::now(), call });
+                overdue.insert(
+                    key,
+                    Overdue {
+                        since: Instant::now(),
+                        call,
+                    },
+                );
                 Ok(Delivery::TimedOut)
             }
         }
@@ -249,7 +258,9 @@ impl Notifier for DesktopNotifier {
 
     fn retain_pending(&self, keys: &HashSet<i64>) {
         self.overdue().retain(|key, pending| {
-            if keys.contains(key) { return true; }
+            if keys.contains(key) {
+                return true;
+            }
             pending.call.abort();
             false
         });
@@ -267,7 +278,9 @@ fn session_bus_address() -> Option<String> {
     }
     let candidates = [
         std::env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("bus")),
-        Some(PathBuf::from(format!("/run/user/{}/bus", unsafe { libc::getuid() }))),
+        Some(PathBuf::from(format!("/run/user/{}/bus", unsafe {
+            libc::getuid()
+        }))),
     ];
     for socket in candidates.into_iter().flatten() {
         if socket.exists() {
@@ -296,14 +309,14 @@ async fn send(address: String, spec: NotifySpec) -> Result<DeliveryReceipt> {
             "Notify",
             &(
                 "cued",
-                0u32,          // never replaces: IDs don't survive server lifetimes,
-                               // and a known-shown row is never re-sent (§3.5)
+                0u32, // never replaces: IDs don't survive server lifetimes,
+                // and a known-shown row is never re-sent (§3.5)
                 "appointment", // themed stock icon; close enough for a scheduler
                 spec.title.as_str(),
                 spec.body.as_str(),
                 Vec::<&str>::new(), // no actions — the socket is the control surface
                 HashMap::<&str, Value<'_>>::new(),
-                -1i32,         // server-default expiry
+                -1i32, // server-default expiry
             ),
         )
         .await
@@ -341,12 +354,14 @@ mod tests {
         use crate::daemon::{DeliveryLedger, deliver_pending};
         use crate::store::Store;
         use jiff::Timestamp;
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         struct Stopped(Arc<AtomicBool>);
         impl Drop for Stopped {
-            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
         }
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db")).await?;
@@ -360,12 +375,29 @@ mod tests {
             std::future::pending::<Result<crate::model::DeliveryReceipt>>().await
         });
         arrived.await?;
-        notifier.overdue().insert(123, super::Overdue { since: std::time::Instant::now(), call });
-        deliver_pending(&store, &notifier, &mut DeliveryLedger::default(), &Timestamp::now()).await?;
-        assert!(notifier.overdue().is_empty(), "GC-deleted rows must release transport handles without another timeout");
+        notifier.overdue().insert(
+            123,
+            super::Overdue {
+                since: std::time::Instant::now(),
+                call,
+            },
+        );
+        deliver_pending(
+            &store,
+            &notifier,
+            &mut DeliveryLedger::default(),
+            &Timestamp::now(),
+        )
+        .await?;
+        assert!(
+            notifier.overdue().is_empty(),
+            "GC-deleted rows must release transport handles without another timeout"
+        );
         tokio::task::yield_now().await;
-        assert!(stopped.load(Ordering::SeqCst), "pending transport task must be aborted");
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "pending transport task must be aborted"
+        );
         Ok(())
     }
-
 }

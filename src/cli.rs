@@ -201,7 +201,10 @@ mod tests {
     #[test]
     fn at_takes_argv_after_separator() {
         // §2.2: after `--`, argv — including hyphenated flags.
-        assert_eq!(parse_at(&["cued", "at", "9am", "--", "./x", "--full"]), ["./x", "--full"]);
+        assert_eq!(
+            parse_at(&["cued", "at", "9am", "--", "./x", "--full"]),
+            ["./x", "--full"]
+        );
     }
 
     #[test]
@@ -238,12 +241,20 @@ mod tests {
     #[test]
     fn at_flags_precede_the_command() {
         let (name, command) = match Cli::try_parse_from([
-            "cued", "at", "--name", "backup", "9am", "--", "./backup.sh",
+            "cued",
+            "at",
+            "--name",
+            "backup",
+            "9am",
+            "--",
+            "./backup.sh",
         ])
         .expect("parse")
         .command
         {
-            Command::At { command, common, .. } => (common.name, command),
+            Command::At {
+                command, common, ..
+            } => (common.name, command),
             other => panic!("expected At, got {other:?}"),
         };
         assert_eq!(name.as_deref(), Some("backup"));

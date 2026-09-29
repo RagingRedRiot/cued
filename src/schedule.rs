@@ -15,9 +15,9 @@
 //!   occurrence) and the §9.2 short-month clamp.
 
 use anyhow::{Context, Result, bail, ensure};
+use jiff::Timestamp;
 use jiff::civil::{Date, DateTime};
 use jiff::tz::TimeZone;
-use jiff::Timestamp;
 
 use crate::model::{CalendarSpec, MonthDay, Schedule};
 
@@ -43,8 +43,7 @@ pub fn next_fire(schedule: &Schedule, after: &Timestamp) -> Result<Option<Timest
         Schedule::Calendar {
             spec, zone, until, ..
         } => {
-            let tz =
-                TimeZone::get(zone).with_context(|| format!("unknown time zone {zone:?}"))?;
+            let tz = TimeZone::get(zone).with_context(|| format!("unknown time zone {zone:?}"))?;
             clip_until(Some(next_calendar(spec, &tz, after)?), until)
         }
     };
@@ -150,7 +149,10 @@ pub(crate) fn due_instants(
     // shape. (It used to send `until` schedules down the bounded walk below,
     // where a short interval plus real downtime could blow the walk's cap
     // and leave the job erroring on every tick forever.)
-    if let Schedule::Every { interval, until, .. } = schedule {
+    if let Schedule::Every {
+        interval, until, ..
+    } = schedule
+    {
         let step = interval.as_nanos();
         ensure!(
             step > 0,
@@ -167,8 +169,7 @@ pub(crate) fn due_instants(
             periods = periods.min(i128::from(limit.saturating_sub(1)));
         }
         let instant = |n: i128| -> Result<Timestamp> {
-            Timestamp::from_nanosecond(start + n * step)
-                .context("Every schedule out of range")
+            Timestamp::from_nanosecond(start + n * step).context("Every schedule out of range")
         };
         let latest = instant(periods)?;
         let previous = (periods >= 1).then(|| instant(periods - 1)).transpose()?;
@@ -189,11 +190,13 @@ pub(crate) fn due_instants(
         }
         previous = Some(std::mem::replace(&mut latest, next));
         count += 1;
-        ensure!(count < 200_000, "over 200k missed firings — refusing to walk them");
+        ensure!(
+            count < 200_000,
+            "over 200k missed firings — refusing to walk them"
+        );
     }
     Ok((latest, previous, count))
 }
-
 
 #[cfg(test)]
 mod tests {

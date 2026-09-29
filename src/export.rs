@@ -51,9 +51,16 @@ pub fn job_to_toml(job: &Job, reader: &jiff::tz::TimeZone) -> String {
     out.push_str("# cued job ");
     out.push_str(&job.id.to_string());
     out.push_str(" (cued show --toml). Policy keys at their defaults are omitted.\n");
-    out.push_str(&format!("# status: {}; source: {:?}\n", job.display_status(), job.source));
+    out.push_str(&format!(
+        "# status: {}; source: {:?}\n",
+        job.display_status(),
+        job.source
+    ));
     if let Some(at) = job.expired_at {
-        out.push_str(&format!("# expired: {at}; reason: {:?}\n", job.expiry_reason));
+        out.push_str(&format!(
+            "# expired: {at}; reason: {:?}\n",
+            job.expiry_reason
+        ));
     }
     out.push('\n');
 
@@ -66,16 +73,22 @@ pub fn job_to_toml(job: &Job, reader: &jiff::tz::TimeZone) -> String {
     // answer "what happens to a *firing*", which is not something a step
     // inherits.
     if job.policies.catch_up != CatchUp::default() {
-        out.push_str(&format!("catch_up = {}\n", quote(match job.policies.catch_up {
-            CatchUp::RunOnce => "run_once",
-            CatchUp::Skip => "skip",
-        })));
+        out.push_str(&format!(
+            "catch_up = {}\n",
+            quote(match job.policies.catch_up {
+                CatchUp::RunOnce => "run_once",
+                CatchUp::Skip => "skip",
+            })
+        ));
     }
     if job.policies.overlap != Overlap::default() {
-        out.push_str(&format!("overlap = {}\n", quote(match job.policies.overlap {
-            Overlap::Skip => "skip",
-            Overlap::Queue => "queue",
-        })));
+        out.push_str(&format!(
+            "overlap = {}\n",
+            quote(match job.policies.overlap {
+                Overlap::Skip => "skip",
+                Overlap::Queue => "queue",
+            })
+        ));
     }
 
     out.push_str(&defaults_table(job));
@@ -115,7 +128,12 @@ fn schedule_keys(schedule: &Schedule, zone: &jiff::tz::TimeZone) -> String {
             out.push_str(&format!("at    = {}\n", quote(&instant(at, zone))));
             out.push_str(&zone_key(zone));
         }
-        Schedule::Every { interval, anchor, until, count } => {
+        Schedule::Every {
+            interval,
+            anchor,
+            until,
+            count,
+        } => {
             // Always emit the anchor. "`every` alone anchors at submit time"
             // (§4.1) would re-anchor to *now* on resubmit, silently shifting
             // every future firing; `at` + `every` is the anchored form and
@@ -128,7 +146,9 @@ fn schedule_keys(schedule: &Schedule, zone: &jiff::tz::TimeZone) -> String {
         // The rule names the zone it *means*, and `job_to_toml` has already
         // made that the file's zone, so every other instant here is written
         // in it too and the one `zone` key is true of all of them.
-        Schedule::Calendar { spec, until, count, .. } => {
+        Schedule::Calendar {
+            spec, until, count, ..
+        } => {
             out.push_str(&format!("every = {}\n", quote(&calendar(spec))));
             out.push_str(&zone_key(zone));
             out.push_str(&limit_keys(until, count, zone));
@@ -229,7 +249,13 @@ fn duration(value: SignedDuration) -> String {
         return "0s".to_string();
     }
     let mut out = String::new();
-    for (unit, size) in [("w", 604_800), ("d", 86_400), ("h", 3_600), ("m", 60), ("s", 1)] {
+    for (unit, size) in [
+        ("w", 604_800),
+        ("d", 86_400),
+        ("h", 3_600),
+        ("m", 60),
+        ("s", 1),
+    ] {
         let whole = secs / size;
         if whole > 0 {
             out.push_str(&format!("{whole}{unit}"));
@@ -249,14 +275,20 @@ fn defaults_table(job: &Job) -> String {
         body.push_str(&format!("deadline = {}\n", quote(&duration(deadline))));
     }
     if job.policies.on_interrupt != OnInterrupt::default() {
-        body.push_str(&format!("on_interrupt = {}\n", quote(match job.policies.on_interrupt {
-            OnInterrupt::Hold => "hold",
-            OnInterrupt::Fail => "fail",
-            OnInterrupt::Retry => "retry",
-        })));
+        body.push_str(&format!(
+            "on_interrupt = {}\n",
+            quote(match job.policies.on_interrupt {
+                OnInterrupt::Hold => "hold",
+                OnInterrupt::Fail => "fail",
+                OnInterrupt::Retry => "retry",
+            })
+        ));
     }
     if job.policies.missed_wait != MissedWait::default() {
-        body.push_str(&format!("missed_wait = {}\n", quote(missed_wait(job.policies.missed_wait))));
+        body.push_str(&format!(
+            "missed_wait = {}\n",
+            quote(missed_wait(job.policies.missed_wait))
+        ));
     }
     format!("\n[defaults]\n{body}")
 }
@@ -379,8 +411,15 @@ fn effect(then: &Effect, zone: &jiff::tz::TimeZone) -> String {
             })
         ),
         Effect::Goto { step, after: None } => format!("{{ goto = {} }}", quote(step)),
-        Effect::Goto { step, after: Some(wait) } => {
-            format!("{{ goto = {}, after = {} }}", quote(step), after(wait, zone))
+        Effect::Goto {
+            step,
+            after: Some(wait),
+        } => {
+            format!(
+                "{{ goto = {}, after = {} }}",
+                quote(step),
+                after(wait, zone)
+            )
         }
     }
 }
@@ -431,9 +470,7 @@ mod tests {
     use jiff::civil::time;
 
     use super::*;
-    use crate::model::{
-        CapturedEnv, Graph, Hooks, JobId, JobStatus, OutputMatch, Policies, Step,
-    };
+    use crate::model::{CapturedEnv, Graph, Hooks, JobId, JobStatus, OutputMatch, Policies, Step};
 
     fn zoned(text: &str) -> Timestamp {
         text.parse().expect(text)
@@ -464,7 +501,10 @@ mod tests {
             name: Some("nightly".into()),
             schedule,
             status: JobStatus::Active,
-            approval: None, source: crate::model::JobSource::Cli, expired_at: None, expiry_reason: None,
+            approval: None,
+            source: crate::model::JobSource::Cli,
+            expired_at: None,
+            expiry_reason: None,
             graph: Graph {
                 entry: entry.into(),
                 steps: steps
@@ -496,7 +536,12 @@ mod tests {
 
     #[test]
     fn calendar_rules_render_in_the_9_2_grammar() {
-        assert_eq!(calendar(&CalendarSpec::Daily { at: time(9, 0, 0, 0) }), "day 09:00");
+        assert_eq!(
+            calendar(&CalendarSpec::Daily {
+                at: time(9, 0, 0, 0)
+            }),
+            "day 09:00"
+        );
         assert_eq!(
             calendar(&CalendarSpec::Weekly {
                 days: vec![Weekday::Mon, Weekday::Wed, Weekday::Fri],
@@ -524,12 +569,23 @@ mod tests {
             until: None,
             count: Some(30),
         };
-        let rendered = job_to_toml(&job(
-            schedule,
-            vec![("run", step(Action::Shell { argv: vec!["/bin/true".into()] }))],
-            "run",
-        ), &denver());
-        assert!(rendered.contains(r#"at    = "2026-07-16 09:00:00""#), "{rendered}");
+        let rendered = job_to_toml(
+            &job(
+                schedule,
+                vec![(
+                    "run",
+                    step(Action::Shell {
+                        argv: vec!["/bin/true".into()],
+                    }),
+                )],
+                "run",
+            ),
+            &denver(),
+        );
+        assert!(
+            rendered.contains(r#"at    = "2026-07-16 09:00:00""#),
+            "{rendered}"
+        );
         assert!(rendered.contains(r#"every = "6h""#), "{rendered}");
         assert!(rendered.contains("count = 30"), "{rendered}");
     }
@@ -539,18 +595,33 @@ mod tests {
     #[test]
     fn the_two_shell_forms_survive_the_round_trip_distinctly() {
         let sh = step(Action::Shell {
-            argv: vec!["/bin/sh".into(), "-c".into(), "make build && make deploy".into()],
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "make build && make deploy".into(),
+            ],
         });
         let argv = step(Action::Shell {
             argv: vec!["./deploy.sh".into(), "--target".into(), "prod".into()],
         });
-        let rendered = job_to_toml(&job(
-            Schedule::Once { at: zoned("2026-07-16T09:00:00-06:00[America/Denver]") },
-            vec![("a", sh), ("b", argv)],
-            "a",
-        ), &denver());
-        assert!(rendered.contains(r#"run = "make build && make deploy""#), "{rendered}");
-        assert!(rendered.contains(r#"run = ["./deploy.sh", "--target", "prod"]"#), "{rendered}");
+        let rendered = job_to_toml(
+            &job(
+                Schedule::Once {
+                    at: zoned("2026-07-16T09:00:00-06:00[America/Denver]"),
+                },
+                vec![("a", sh), ("b", argv)],
+                "a",
+            ),
+            &denver(),
+        );
+        assert!(
+            rendered.contains(r#"run = "make build && make deploy""#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"run = ["./deploy.sh", "--target", "prod"]"#),
+            "{rendered}"
+        );
     }
 
     /// The §6.2 escape hatch, which is what export always emits: ordered,
@@ -566,7 +637,9 @@ mod tests {
         verify.transitions = vec![
             Transition {
                 when: Condition::ExitEq(0),
-                then: Effect::End { outcome: Outcome::Success },
+                then: Effect::End {
+                    outcome: Outcome::Success,
+                },
             },
             Transition {
                 when: Condition::Stdout(OutputMatch::Contains("starting".into())),
@@ -581,24 +654,40 @@ mod tests {
             },
             Transition {
                 when: Condition::All(vec![Condition::Failed, Condition::ExitIn(vec![1, 2])]),
-                then: Effect::Goto { step: "verify".into(), after: None },
+                then: Effect::Goto {
+                    step: "verify".into(),
+                    after: None,
+                },
             },
             Transition {
                 when: Condition::Always,
-                then: Effect::End { outcome: Outcome::Failure },
+                then: Effect::End {
+                    outcome: Outcome::Failure,
+                },
             },
         ];
-        let rendered = job_to_toml(&job(
-            Schedule::Once { at: zoned("2026-07-16T09:00:00-06:00[America/Denver]") },
-            vec![("verify", verify)],
-            "verify",
-        ), &denver());
+        let rendered = job_to_toml(
+            &job(
+                Schedule::Once {
+                    at: zoned("2026-07-16T09:00:00-06:00[America/Denver]"),
+                },
+                vec![("verify", verify)],
+                "verify",
+            ),
+            &denver(),
+        );
 
         assert!(rendered.contains("max_visits = 10"), "{rendered}");
         assert!(rendered.contains(r#"timeout = "10m""#), "{rendered}");
         assert!(rendered.contains("when = { exit = 0 }"), "{rendered}");
-        assert!(rendered.contains(r#"then = { end = "success" }"#), "{rendered}");
-        assert!(rendered.contains(r#"when = { stdout_contains = "starting" }"#), "{rendered}");
+        assert!(
+            rendered.contains(r#"then = { end = "success" }"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"when = { stdout_contains = "starting" }"#),
+            "{rendered}"
+        );
         assert!(
             rendered.contains(r#"after = { start = "30s", factor = 2, max = "10m" }"#),
             "{rendered}"
@@ -611,7 +700,10 @@ mod tests {
         // order — check the catch-all really is last.
         let always = rendered.find(r#"when = "always""#).expect("always edge");
         let first = rendered.find("when = { exit = 0 }").expect("exit edge");
-        assert!(first < always, "transition order was not preserved:\n{rendered}");
+        assert!(
+            first < always,
+            "transition order was not preserved:\n{rendered}"
+        );
     }
 
     /// Step ids, commands and notification bodies are arbitrary user text;
@@ -646,15 +738,23 @@ mod tests {
             title: r#"deploy "prod" paused"#.into(),
             body: "needs a look\nrun: cued continue j7".into(),
         });
-        let rendered = job_to_toml(&job(
-            Schedule::Once { at: zoned("2026-07-16T09:00:00-06:00[America/Denver]") },
-            vec![("nudge", notify)],
-            "nudge",
-        ), &denver());
+        let rendered = job_to_toml(
+            &job(
+                Schedule::Once {
+                    at: zoned("2026-07-16T09:00:00-06:00[America/Denver]"),
+                },
+                vec![("nudge", notify)],
+                "nudge",
+            ),
+            &denver(),
+        );
         let parsed: toml::Value = rendered.parse().expect("export must be valid TOML");
         assert_eq!(parsed["name"].as_str(), Some("nightly"));
         let steps = parsed["step"].as_array().expect("[[step]]");
-        assert_eq!(steps[0]["notify"]["title"].as_str(), Some(r#"deploy "prod" paused"#));
+        assert_eq!(
+            steps[0]["notify"]["title"].as_str(),
+            Some(r#"deploy "prod" paused"#)
+        );
         assert_eq!(
             steps[0]["notify"]["body"].as_str(),
             Some("needs a look\nrun: cued continue j7")
@@ -667,11 +767,21 @@ mod tests {
     #[test]
     fn the_captured_environment_is_not_exported() {
         let mut detail = job(
-            Schedule::Once { at: zoned("2026-07-16T09:00:00-06:00[America/Denver]") },
-            vec![("run", step(Action::Shell { argv: vec!["/bin/true".into()] }))],
+            Schedule::Once {
+                at: zoned("2026-07-16T09:00:00-06:00[America/Denver]"),
+            },
+            vec![(
+                "run",
+                step(Action::Shell {
+                    argv: vec!["/bin/true".into()],
+                }),
+            )],
             "run",
         );
-        detail.env.vars.insert("AWS_REGION".into(), "us-east-1".into());
+        detail
+            .env
+            .vars
+            .insert("AWS_REGION".into(), "us-east-1".into());
         detail.env.stripped.push("DEPLOY_TOKEN".into());
 
         let rendered = job_to_toml(&detail, &denver());
@@ -703,19 +813,26 @@ mod zone_tests {
             id: JobId(1),
             name: None,
             schedule: Schedule::Calendar {
-                spec: CalendarSpec::Daily { at: jiff::civil::time(9, 0, 0, 0) },
+                spec: CalendarSpec::Daily {
+                    at: jiff::civil::time(9, 0, 0, 0),
+                },
                 zone: "America/New_York".into(),
                 until: Some(until),
                 count: None,
             },
             status: JobStatus::Active,
-            approval: None, source: crate::model::JobSource::Cli, expired_at: None, expiry_reason: None,
+            approval: None,
+            source: crate::model::JobSource::Cli,
+            expired_at: None,
+            expiry_reason: None,
             graph: Graph {
                 entry: "run".into(),
                 steps: BTreeMap::from([(
                     "run".to_string(),
                     Step {
-                        action: Action::Shell { argv: vec!["/bin/true".into()] },
+                        action: Action::Shell {
+                            argv: vec!["/bin/true".into()],
+                        },
                         cwd: None,
                         env: None,
                         timeout: None,
@@ -738,7 +855,10 @@ mod zone_tests {
         // rule's, so a mismatch cannot hide.
         let rendered = job_to_toml(&job, &tokyo);
 
-        assert!(rendered.contains(r#"zone  = "America/New_York""#), "{rendered}");
+        assert!(
+            rendered.contains(r#"zone  = "America/New_York""#),
+            "{rendered}"
+        );
         // 05:00Z is midnight in New York and 14:00 in Tokyo. The file says
         // New York, so it has to say midnight.
         assert!(

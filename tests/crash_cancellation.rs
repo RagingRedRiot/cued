@@ -14,7 +14,9 @@ async fn fixture() -> Result<(tempfile::TempDir, Store, JobId, RunId, Timestamp)
     let store = Store::open(&dir.path().join("db")).await?;
     let now = Timestamp::now();
     let step = Step {
-        action: Action::Shell { argv: vec!["/bin/true".into()] },
+        action: Action::Shell {
+            argv: vec!["/bin/true".into()],
+        },
         cwd: None,
         env: None,
         timeout: None,
@@ -41,11 +43,13 @@ async fn fixture() -> Result<(tempfile::TempDir, Store, JobId, RunId, Timestamp)
 }
 
 async fn cursor(store: &Store, job: JobId, run: RunId) -> Result<(String, String)> {
-    Ok(sqlx::query_as("SELECT status, cursor_kind FROM runs WHERE job_id = ? AND id = ?")
-        .bind(job.0)
-        .bind(run.0)
-        .fetch_one(store.pool())
-        .await?)
+    Ok(
+        sqlx::query_as("SELECT status, cursor_kind FROM runs WHERE job_id = ? AND id = ?")
+            .bind(job.0)
+            .bind(run.0)
+            .fetch_one(store.pool())
+            .await?,
+    )
 }
 
 async fn ended(store: &Store, job: JobId, run: RunId, attempt: u32) -> Result<Option<String>> {
@@ -67,11 +71,23 @@ async fn ended(store: &Store, job: JobId, run: RunId, attempt: u32) -> Result<Op
 #[tokio::test]
 async fn a_pause_after_the_claim_does_not_revoke_it() -> Result<()> {
     let (_dir, store, job, run, now) = fixture().await?;
-    let attempt = store.begin_step(job, run, "main", &now).await?.expect("claimed");
+    let attempt = store
+        .begin_step(job, run, "main", &now)
+        .await?
+        .expect("claimed");
     store.set_paused(job).await?;
 
     assert!(
-        store.claim_is_current(job, run, Claim { step: "main", attempt }).await?,
+        store
+            .claim_is_current(
+                job,
+                run,
+                Claim {
+                    step: "main",
+                    attempt
+                }
+            )
+            .await?,
         "a pause must not revoke a claim it can't un-make"
     );
     assert_eq!(cursor(&store, job, run).await?.1, "running");
@@ -93,9 +109,23 @@ async fn a_pause_before_the_claim_still_prevents_it() -> Result<()> {
 #[tokio::test]
 async fn a_cancel_after_the_claim_still_revokes_it() -> Result<()> {
     let (_dir, store, job, run, now) = fixture().await?;
-    let attempt = store.begin_step(job, run, "main", &now).await?.expect("claimed");
+    let attempt = store
+        .begin_step(job, run, "main", &now)
+        .await?
+        .expect("claimed");
     store.cancel_job(job, &now).await?;
-    assert!(!store.claim_is_current(job, run, Claim { step: "main", attempt }).await?);
+    assert!(
+        !store
+            .claim_is_current(
+                job,
+                run,
+                Claim {
+                    step: "main",
+                    attempt
+                }
+            )
+            .await?
+    );
     Ok(())
 }
 
@@ -105,11 +135,25 @@ async fn a_cancel_after_the_claim_still_revokes_it() -> Result<()> {
 #[tokio::test]
 async fn the_deadline_closes_its_attempt_in_the_same_commit() -> Result<()> {
     let (_dir, store, job, run, now) = fixture().await?;
-    let attempt = store.begin_step(job, run, "main", &now).await?.expect("claimed");
-    let claim = Claim { step: "main", attempt };
+    let attempt = store
+        .begin_step(job, run, "main", &now)
+        .await?
+        .expect("claimed");
+    let claim = Claim {
+        step: "main",
+        attempt,
+    };
 
-    assert!(store.fail_deadline(job, run, "main", &now, None, Some(claim)).await?.is_some());
-    assert_eq!(cursor(&store, job, run).await?, ("failed".into(), "done".into()));
+    assert!(
+        store
+            .fail_deadline(job, run, "main", &now, None, Some(claim))
+            .await?
+            .is_some()
+    );
+    assert_eq!(
+        cursor(&store, job, run).await?,
+        ("failed".into(), "done".into())
+    );
     assert!(ended(&store, job, run, attempt).await?.is_some());
     Ok(())
 }
@@ -119,15 +163,38 @@ async fn the_deadline_closes_its_attempt_in_the_same_commit() -> Result<()> {
 #[tokio::test]
 async fn a_stale_deadline_closes_only_its_own_attempt() -> Result<()> {
     let (_dir, store, job, run, now) = fixture().await?;
-    let old = store.begin_step(job, run, "main", &now).await?.expect("claimed");
+    let old = store
+        .begin_step(job, run, "main", &now)
+        .await?
+        .expect("claimed");
     store.cancel_job(job, &now).await?;
     store.rewind_run(job, run, "main", &now).await?;
-    let new = store.begin_step(job, run, "main", &now).await?.expect("reclaimed");
+    let new = store
+        .begin_step(job, run, "main", &now)
+        .await?
+        .expect("reclaimed");
 
-    let stale = Claim { step: "main", attempt: old };
-    assert!(store.fail_deadline(job, run, "main", &now, None, Some(stale)).await?.is_none());
-    assert_eq!(cursor(&store, job, run).await?, ("running".into(), "running".into()));
-    assert!(ended(&store, job, run, old).await?.is_some(), "the old attempt did stop");
-    assert!(ended(&store, job, run, new).await?.is_none(), "the live attempt is not ended");
+    let stale = Claim {
+        step: "main",
+        attempt: old,
+    };
+    assert!(
+        store
+            .fail_deadline(job, run, "main", &now, None, Some(stale))
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        cursor(&store, job, run).await?,
+        ("running".into(), "running".into())
+    );
+    assert!(
+        ended(&store, job, run, old).await?.is_some(),
+        "the old attempt did stop"
+    );
+    assert!(
+        ended(&store, job, run, new).await?.is_none(),
+        "the live attempt is not ended"
+    );
     Ok(())
 }

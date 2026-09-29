@@ -8,8 +8,8 @@ use jiff::{SignedDuration, Timestamp};
 use cued::config::Retention;
 use cued::daemon::collect_garbage;
 use cued::model::{
-    CapturedEnv, HeldReason, Hooks, JobId, JobSpec, NotifySpec, Policies, RunId,
-    RunStatus, Schedule,
+    CapturedEnv, HeldReason, Hooks, JobId, JobSpec, NotifySpec, Policies, RunId, RunStatus,
+    Schedule,
 };
 use cued::paths::Paths;
 use cued::store::{NextCursor, StepClose, Store};
@@ -35,7 +35,11 @@ async fn harness() -> Result<Harness> {
     };
     std::fs::create_dir_all(&paths.logs_dir)?;
     let store = Store::open(&paths.db_file).await?;
-    Ok(Harness { _dir: dir, paths, store })
+    Ok(Harness {
+        _dir: dir,
+        paths,
+        store,
+    })
 }
 
 fn spec(name: &str, schedule: Schedule) -> JobSpec {
@@ -62,7 +66,11 @@ fn recurring(anchor: &Timestamp) -> Schedule {
 /// Drive one run to a terminal cursor, writing a log file for it so the
 /// §2.1 bytes are there to be pruned too.
 async fn finish_run(h: &Harness, job: JobId, run: RunId, at: &Timestamp) -> Result<()> {
-    let attempt = h.store.begin_step(job, run, "run", at).await?.expect("claim");
+    let attempt = h
+        .store
+        .begin_step(job, run, "run", at)
+        .await?
+        .expect("claim");
     let log = h.paths.step_log(job, run, "run", attempt);
     std::fs::create_dir_all(log.parent().expect("parent"))?;
     std::fs::write(&log, b"output\n")?;
@@ -77,7 +85,10 @@ async fn finish_run(h: &Harness, job: JobId, run: RunId, at: &Timestamp) -> Resu
             exit_code: Some(0),
             timed_out: false,
             outcome_edge: None,
-            next: NextCursor::Terminal { status: RunStatus::Done, fail_reason: None },
+            next: NextCursor::Terminal {
+                status: RunStatus::Done,
+                fail_reason: None,
+            },
             notifications: Vec::new(),
         })
         .await?;
@@ -101,7 +112,10 @@ async fn both_retention_rules_bite() -> Result<()> {
     let h = harness().await?;
     let now = Timestamp::now();
     let anchor = now.checked_sub(SignedDuration::from_hours(24 * 90))?;
-    let (job, _, _) = h.store.submit_job(&spec("busy", recurring(&anchor)), &anchor).await?;
+    let (job, _, _) = h
+        .store
+        .submit_job(&spec("busy", recurring(&anchor)), &anchor)
+        .await?;
 
     // Ten runs: the oldest five finished 60 days ago, the rest just now.
     for index in 1..=10 {
@@ -127,23 +141,38 @@ async fn both_retention_rules_bite() -> Result<()> {
     let aged = collect_garbage(
         &h.store,
         &h.paths,
-        &Retention { days: 30, runs_per_job: 100 },
+        &Retention {
+            days: 30,
+            runs_per_job: 100,
+        },
         &now,
     )
     .await?;
-    assert_eq!(aged.runs.len(), 5, "the five 60-day-old runs: {:?}", aged.runs);
+    assert_eq!(
+        aged.runs.len(),
+        5,
+        "the five 60-day-old runs: {:?}",
+        aged.runs
+    );
     assert_eq!(run_ids(&h.store, job).await, [6, 7, 8, 9, 10]);
 
     // Count alone: everything is recent now, but keep only 3.
     let counted = collect_garbage(
         &h.store,
         &h.paths,
-        &Retention { days: 3650, runs_per_job: 3 },
+        &Retention {
+            days: 3650,
+            runs_per_job: 3,
+        },
         &now,
     )
     .await?;
     assert_eq!(counted.runs.len(), 2, "runs 6 and 7: {:?}", counted.runs);
-    assert_eq!(run_ids(&h.store, job).await, [8, 9, 10], "the newest are kept");
+    assert_eq!(
+        run_ids(&h.store, job).await,
+        [8, 9, 10],
+        "the newest are kept"
+    );
     Ok(())
 }
 
@@ -164,10 +193,22 @@ async fn pruning_a_run_takes_its_logs_with_it() -> Result<()> {
     let log = h.paths.step_log(job, run, "run", 1);
     assert!(log.exists(), "the test should have written a log");
 
-    collect_garbage(&h.store, &h.paths, &Retention { days: 30, runs_per_job: 20 }, &now).await?;
+    collect_garbage(
+        &h.store,
+        &h.paths,
+        &Retention {
+            days: 30,
+            runs_per_job: 20,
+        },
+        &now,
+    )
+    .await?;
 
     assert!(!log.exists(), "the log file outlived its run");
-    assert!(!h.paths.run_log_dir(job, run).exists(), "the run's log dir outlived it");
+    assert!(
+        !h.paths.run_log_dir(job, run).exists(),
+        "the run's log dir outlived it"
+    );
     Ok(())
 }
 
@@ -204,17 +245,33 @@ async fn a_spent_one_shot_goes_but_a_live_recurring_job_stays() -> Result<()> {
     .await?;
     finish_run(&h, recurring_job, RunId(1), &old).await?;
 
-    let outcome =
-        collect_garbage(&h.store, &h.paths, &Retention { days: 30, runs_per_job: 20 }, &now)
-            .await?;
+    let outcome = collect_garbage(
+        &h.store,
+        &h.paths,
+        &Retention {
+            days: 30,
+            runs_per_job: 20,
+        },
+        &now,
+    )
+    .await?;
 
     assert_eq!(outcome.runs.len(), 2, "both ancient runs go");
-    assert_eq!(outcome.jobs, [one_shot], "only the spent one-shot: {:?}", outcome.jobs);
+    assert_eq!(
+        outcome.jobs,
+        [one_shot],
+        "only the spent one-shot: {:?}",
+        outcome.jobs
+    );
 
     let surviving: Vec<i64> = sqlx::query_scalar("SELECT id FROM jobs ORDER BY id")
         .fetch_all(h.store.pool())
         .await?;
-    assert_eq!(surviving, [recurring_job.0], "the live schedule must survive its history");
+    assert_eq!(
+        surviving,
+        [recurring_job.0],
+        "the live schedule must survive its history"
+    );
     Ok(())
 }
 
@@ -227,7 +284,10 @@ async fn held_and_live_runs_are_never_collected() -> Result<()> {
     let h = harness().await?;
     let now = Timestamp::now();
     let ancient = now.checked_sub(SignedDuration::from_hours(24 * 400))?;
-    let (job, _, _) = h.store.submit_job(&spec("keep", recurring(&ancient)), &ancient).await?;
+    let (job, _, _) = h
+        .store
+        .submit_job(&spec("keep", recurring(&ancient)), &ancient)
+        .await?;
 
     // Three ancient runs, one per non-terminal cursor kind — run 1 goes in
     // `running` so `hold_run` below parks it the way reconciliation would.
@@ -256,7 +316,10 @@ async fn held_and_live_runs_are_never_collected() -> Result<()> {
             RunId(1),
             "run",
             HeldReason::Interrupted,
-            &NotifySpec { title: "parked".into(), body: "look at me".into() },
+            &NotifySpec {
+                title: "parked".into(),
+                body: "look at me".into(),
+            },
             &ancient,
             None,
         )
@@ -267,20 +330,32 @@ async fn held_and_live_runs_are_never_collected() -> Result<()> {
         &h.paths,
         // As aggressive as the policy can be: keep nothing by count, and
         // treat anything over a day old as expired.
-        &Retention { days: 1, runs_per_job: 0 },
+        &Retention {
+            days: 1,
+            runs_per_job: 0,
+        },
         &now,
     )
     .await?;
 
-    assert!(outcome.runs.is_empty(), "a non-terminal run was collected: {:?}", outcome.runs);
-    assert!(outcome.jobs.is_empty(), "a job with live runs was collected");
+    assert!(
+        outcome.runs.is_empty(),
+        "a non-terminal run was collected: {:?}",
+        outcome.runs
+    );
+    assert!(
+        outcome.jobs.is_empty(),
+        "a job with live runs was collected"
+    );
     assert_eq!(run_ids(&h.store, job).await, [1, 2, 3]);
 
-    let pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM notifications WHERE delivered_at IS NULL",
-    )
-    .fetch_one(h.store.pool())
-    .await?;
-    assert_eq!(pending, 1, "the held run's notification must survive with it");
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM notifications WHERE delivered_at IS NULL")
+            .fetch_one(h.store.pool())
+            .await?;
+    assert_eq!(
+        pending, 1,
+        "the held run's notification must survive with it"
+    );
     Ok(())
 }

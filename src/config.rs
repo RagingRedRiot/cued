@@ -52,9 +52,15 @@ pub struct EnvPolicy {
 impl Default for EnvPolicy {
     fn default() -> Self {
         Self {
-            deny: ["*_TOKEN", "*_SECRET", "*_KEY", "*PASSWORD*", "*_CREDENTIALS"]
-                .map(String::from)
-                .to_vec(),
+            deny: [
+                "*_TOKEN",
+                "*_SECRET",
+                "*_KEY",
+                "*PASSWORD*",
+                "*_CREDENTIALS",
+            ]
+            .map(String::from)
+            .to_vec(),
         }
     }
 }
@@ -69,7 +75,10 @@ pub struct Retention {
 
 impl Default for Retention {
     fn default() -> Self {
-        Self { days: 30, runs_per_job: 20 }
+        Self {
+            days: 30,
+            runs_per_job: 20,
+        }
     }
 }
 
@@ -78,8 +87,8 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 }

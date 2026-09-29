@@ -13,7 +13,10 @@ use anyhow::Result;
 use jiff::{SignedDuration, Timestamp};
 
 use cued::daemon::{Arm, reconcile};
-use cued::model::{Action, CapturedEnv, Condition, Effect, Graph, HeldReason, Hooks, JobId, JobSpec, NotifySpec, OnInterrupt, Policies, RunId, RunStatus, Schedule, Step, Transition};
+use cued::model::{
+    Action, CapturedEnv, Condition, Effect, Graph, HeldReason, Hooks, JobId, JobSpec, NotifySpec,
+    OnInterrupt, Policies, RunId, RunStatus, Schedule, Step, Transition,
+};
 use cued::store::{Claim, DueStep, NextCursor, StepClose, Store};
 
 /// The Step half of an arm list (reconcile also returns recurring Fire arms).
@@ -54,7 +57,12 @@ fn shell_step(transitions: Vec<Transition>, restart_safe: bool) -> Step {
     }
 }
 
-fn one_step_spec(name: &str, at: Timestamp, on_interrupt: OnInterrupt, restart_safe: bool) -> JobSpec {
+fn one_step_spec(
+    name: &str,
+    at: Timestamp,
+    on_interrupt: OnInterrupt,
+    restart_safe: bool,
+) -> JobSpec {
     let graph = Graph {
         entry: "main".into(),
         steps: BTreeMap::from([("main".to_string(), shell_step(Vec::new(), restart_safe))]),
@@ -105,8 +113,12 @@ async fn notification_titles(store: &Store, job: JobId) -> Vec<String> {
 async fn interrupted_running_holds_by_default() -> Result<()> {
     let (_dir, store) = temp_store().await?;
     let now = Timestamp::now();
-    let (job, run) =
-        submit_one(&store, &one_step_spec("held", now, OnInterrupt::Hold, false), &now).await?;
+    let (job, run) = submit_one(
+        &store,
+        &one_step_spec("held", now, OnInterrupt::Hold, false),
+        &now,
+    )
+    .await?;
     claim(&store, job, run, "main", &now).await?; // crash here
 
     let due = reconcile(&store, &now).await?;
@@ -130,8 +142,12 @@ async fn interrupted_running_holds_by_default() -> Result<()> {
 async fn interrupted_with_fail_policy_fails_fast() -> Result<()> {
     let (_dir, store) = temp_store().await?;
     let now = Timestamp::now();
-    let (job, run) =
-        submit_one(&store, &one_step_spec("ff", now, OnInterrupt::Fail, false), &now).await?;
+    let (job, run) = submit_one(
+        &store,
+        &one_step_spec("ff", now, OnInterrupt::Fail, false),
+        &now,
+    )
+    .await?;
     claim(&store, job, run, "main", &now).await?;
 
     let due = reconcile(&store, &now).await?;
@@ -180,8 +196,12 @@ async fn interrupted_with_fail_policy_routes_recovery_edge() -> Result<()> {
             ("recovery".to_string(), shell_step(Vec::new(), false)),
         ]),
     };
-    let (job, run) =
-        submit_one(&store, &spec_with("routed", now, graph, OnInterrupt::Fail), &now).await?;
+    let (job, run) = submit_one(
+        &store,
+        &spec_with("routed", now, graph, OnInterrupt::Fail),
+        &now,
+    )
+    .await?;
     claim(&store, job, run, "main", &now).await?;
 
     let due = reconcile(&store, &now).await?;
@@ -200,12 +220,20 @@ async fn interrupted_retry_is_gated_by_restart_safe() -> Result<()> {
     let (_dir, store) = temp_store().await?;
     let now = Timestamp::now();
 
-    let (unsafe_job, unsafe_run) =
-        submit_one(&store, &one_step_spec("no-optin", now, OnInterrupt::Retry, false), &now).await?;
+    let (unsafe_job, unsafe_run) = submit_one(
+        &store,
+        &one_step_spec("no-optin", now, OnInterrupt::Retry, false),
+        &now,
+    )
+    .await?;
     claim(&store, unsafe_job, unsafe_run, "main", &now).await?;
 
-    let (safe_job, safe_run) =
-        submit_one(&store, &one_step_spec("optin", now, OnInterrupt::Retry, true), &now).await?;
+    let (safe_job, safe_run) = submit_one(
+        &store,
+        &one_step_spec("optin", now, OnInterrupt::Retry, true),
+        &now,
+    )
+    .await?;
     claim(&store, safe_job, safe_run, "main", &now).await?;
 
     let due = reconcile(&store, &now).await?;
@@ -215,7 +243,10 @@ async fn interrupted_retry_is_gated_by_restart_safe() -> Result<()> {
     assert_eq!(notification_titles(&store, unsafe_job).await.len(), 1);
     // restart_safe → re-armed to run now; attempts will append.
     assert_eq!(run_status(&store, safe_job).await, "waiting");
-    let rearmed: Vec<_> = step_arms(&due).into_iter().filter(|d| d.job == safe_job).collect();
+    let rearmed: Vec<_> = step_arms(&due)
+        .into_iter()
+        .filter(|d| d.job == safe_job)
+        .collect();
     assert_eq!(rearmed.len(), 1);
     assert_eq!(rearmed[0].step, "main");
     let next_attempt = claim(&store, safe_job, safe_run, "main", &now).await?;
@@ -230,8 +261,12 @@ async fn waiting_cursors_rearm_at_their_frozen_targets() -> Result<()> {
     let (_dir, store) = temp_store().await?;
     let now = Timestamp::now();
     let future = now.checked_add(SignedDuration::from_secs(3600))?;
-    let (job, run) =
-        submit_one(&store, &one_step_spec("later", future, OnInterrupt::Hold, false), &now).await?;
+    let (job, run) = submit_one(
+        &store,
+        &one_step_spec("later", future, OnInterrupt::Hold, false),
+        &now,
+    )
+    .await?;
 
     let due = reconcile(&store, &now).await?;
 
@@ -248,8 +283,12 @@ async fn waiting_cursors_rearm_at_their_frozen_targets() -> Result<()> {
 async fn continue_resumes_held_runs_only() -> Result<()> {
     let (_dir, store) = temp_store().await?;
     let now = Timestamp::now();
-    let (job, run) =
-        submit_one(&store, &one_step_spec("stuck", now, OnInterrupt::Hold, false), &now).await?;
+    let (job, run) = submit_one(
+        &store,
+        &one_step_spec("stuck", now, OnInterrupt::Hold, false),
+        &now,
+    )
+    .await?;
 
     // Not held yet → refused.
     assert!(store.resume_held(job, run, &now).await.is_err());
@@ -271,8 +310,12 @@ async fn continue_resumes_held_runs_only() -> Result<()> {
 async fn retry_rewinds_in_place_with_visit_reset() -> Result<()> {
     let (_dir, store) = temp_store().await?;
     let now = Timestamp::now();
-    let (job, run) =
-        submit_one(&store, &one_step_spec("redo", now, OnInterrupt::Hold, false), &now).await?;
+    let (job, run) = submit_one(
+        &store,
+        &one_step_spec("redo", now, OnInterrupt::Hold, false),
+        &now,
+    )
+    .await?;
 
     // A live run can't be retried.
     assert!(store.rewind_run(job, run, "main", &now).await.is_err());
@@ -321,8 +364,12 @@ async fn retry_rewinds_in_place_with_visit_reset() -> Result<()> {
 async fn resolve_job_accepts_id_or_live_name() -> Result<()> {
     let (_dir, store) = temp_store().await?;
     let now = Timestamp::now();
-    let (job, _) =
-        submit_one(&store, &one_step_spec("backup", now, OnInterrupt::Hold, false), &now).await?;
+    let (job, _) = submit_one(
+        &store,
+        &one_step_spec("backup", now, OnInterrupt::Hold, false),
+        &now,
+    )
+    .await?;
 
     assert_eq!(store.resolve_job(&format!("j{}", job.0)).await?, job);
     assert_eq!(store.resolve_job(&job.0.to_string()).await?, job);
@@ -355,10 +402,22 @@ async fn a_cancel_during_the_claim_window_stops_the_spawn() -> Result<()> {
     let (job, run) = submit_one(&store, &spec, &now).await?;
 
     // The claim commits — this is the daemon about to spawn.
-    let attempt = store.begin_step(job, run, "main", &now).await?.expect("claim");
+    let attempt = store
+        .begin_step(job, run, "main", &now)
+        .await?
+        .expect("claim");
     assert_eq!(attempt, 1);
     assert!(
-        store.claim_is_current(job, run, Claim { step: "main", attempt: 1 }).await?,
+        store
+            .claim_is_current(
+                job,
+                run,
+                Claim {
+                    step: "main",
+                    attempt: 1
+                }
+            )
+            .await?,
         "the step it just claimed must be current"
     );
 
@@ -366,7 +425,16 @@ async fn a_cancel_during_the_claim_window_stops_the_spawn() -> Result<()> {
     store.cancel_job(job, &now).await?;
 
     assert!(
-        !store.claim_is_current(job, run, Claim { step: "main", attempt: 1 }).await?,
+        !store
+            .claim_is_current(
+                job,
+                run,
+                Claim {
+                    step: "main",
+                    attempt: 1
+                }
+            )
+            .await?,
         "a cancelled run must not go on to spawn a process"
     );
     Ok(())
@@ -382,13 +450,49 @@ async fn the_spawn_guard_passes_an_ordinary_claim_and_rejects_a_stale_one() -> R
     let (job, run) = submit_one(&store, &spec, &now).await?;
 
     // Not yet claimed: the cursor is Waiting, not Running.
-    assert!(!store.claim_is_current(job, run, Claim { step: "main", attempt: 1 }).await?);
+    assert!(
+        !store
+            .claim_is_current(
+                job,
+                run,
+                Claim {
+                    step: "main",
+                    attempt: 1
+                }
+            )
+            .await?
+    );
 
-    store.begin_step(job, run, "main", &now).await?.expect("claim");
-    assert!(store.claim_is_current(job, run, Claim { step: "main", attempt: 1 }).await?);
+    store
+        .begin_step(job, run, "main", &now)
+        .await?
+        .expect("claim");
+    assert!(
+        store
+            .claim_is_current(
+                job,
+                run,
+                Claim {
+                    step: "main",
+                    attempt: 1
+                }
+            )
+            .await?
+    );
 
     // A different step of the same run is not this attempt's business.
-    assert!(!store.claim_is_current(job, run, Claim { step: "other", attempt: 1 }).await?);
+    assert!(
+        !store
+            .claim_is_current(
+                job,
+                run,
+                Claim {
+                    step: "other",
+                    attempt: 1
+                }
+            )
+            .await?
+    );
 
     // And once the step closes, the cursor has moved on.
     store
@@ -402,11 +506,25 @@ async fn the_spawn_guard_passes_an_ordinary_claim_and_rejects_a_stale_one() -> R
             exit_code: Some(0),
             timed_out: false,
             outcome_edge: None,
-            next: NextCursor::Terminal { status: RunStatus::Done, fail_reason: None },
+            next: NextCursor::Terminal {
+                status: RunStatus::Done,
+                fail_reason: None,
+            },
             notifications: Vec::new(),
         })
         .await?;
-    assert!(!store.claim_is_current(job, run, Claim { step: "main", attempt: 1 }).await?);
+    assert!(
+        !store
+            .claim_is_current(
+                job,
+                run,
+                Claim {
+                    step: "main",
+                    attempt: 1
+                }
+            )
+            .await?
+    );
     Ok(())
 }
 
@@ -427,9 +545,15 @@ async fn a_held_attempt_is_interrupted_not_running() -> Result<()> {
     let (job, run) = submit_one(&store, &spec, &now).await?;
 
     // Executing: the cursor is on this step, the row is open.
-    store.begin_step(job, run, "main", &now).await?.expect("claim");
+    store
+        .begin_step(job, run, "main", &now)
+        .await?
+        .expect("claim");
     let (_, attempts) = store.log_manifest(job, None, None, None).await?;
-    assert!(attempts[0].running, "an executing attempt must read as running");
+    assert!(
+        attempts[0].running,
+        "an executing attempt must read as running"
+    );
     assert!(attempts[0].ended_at.is_none());
 
     // Interrupted: the row is *still* open — that is deliberate — but the
@@ -440,7 +564,10 @@ async fn a_held_attempt_is_interrupted_not_running() -> Result<()> {
             run,
             "main",
             HeldReason::Interrupted,
-            &NotifySpec { title: "t".into(), body: "b".into() },
+            &NotifySpec {
+                title: "t".into(),
+                body: "b".into(),
+            },
             &now,
             None,
         )
@@ -460,10 +587,16 @@ async fn a_held_attempt_is_interrupted_not_running() -> Result<()> {
     // until the step is claimed again.
     store.resume_held(job, run, &now).await?;
     let (_, attempts) = store.log_manifest(job, None, None, None).await?;
-    assert!(!attempts[0].running, "a resumed-but-unclaimed run executes nothing");
+    assert!(
+        !attempts[0].running,
+        "a resumed-but-unclaimed run executes nothing"
+    );
 
     // And a finished attempt is neither.
-    store.begin_step(job, run, "main", &now).await?.expect("re-claim");
+    store
+        .begin_step(job, run, "main", &now)
+        .await?
+        .expect("re-claim");
     store
         .finish_step(StepClose {
             job,
@@ -475,16 +608,24 @@ async fn a_held_attempt_is_interrupted_not_running() -> Result<()> {
             exit_code: Some(0),
             timed_out: false,
             outcome_edge: None,
-            next: NextCursor::Terminal { status: RunStatus::Done, fail_reason: None },
+            next: NextCursor::Terminal {
+                status: RunStatus::Done,
+                fail_reason: None,
+            },
             notifications: Vec::new(),
         })
         .await?;
     let (_, attempts) = store.log_manifest(job, None, None, None).await?;
-    assert!(attempts.iter().all(|a| !a.running), "nothing runs in a finished run");
-    assert!(attempts[1].ended_at.is_some(), "a completed attempt has an end time");
+    assert!(
+        attempts.iter().all(|a| !a.running),
+        "nothing runs in a finished run"
+    );
+    assert!(
+        attempts[1].ended_at.is_some(),
+        "a completed attempt has an end time"
+    );
     Ok(())
 }
-
 
 /// Set up the sequence Astra's campaign reproduced: attempt 1 is claimed and
 /// its post-claim write is still pending (its store was failing), the run is
@@ -536,12 +677,18 @@ async fn a_stale_close_cannot_end_a_newer_attempt() -> Result<()> {
         exit_code: Some(0),
         timed_out: false,
         outcome_edge: None,
-        next: NextCursor::Terminal { status: RunStatus::Done, fail_reason: None },
+        next: NextCursor::Terminal {
+            status: RunStatus::Done,
+            fail_reason: None,
+        },
         notifications: Vec::new(),
     };
 
     let closed = store.finish_step(close(stale)).await?;
-    assert!(!closed.advanced, "the stale close must not move the newer attempt's run");
+    assert!(
+        !closed.advanced,
+        "the stale close must not move the newer attempt's run"
+    );
     assert_eq!(
         run_state(&store, job, run).await,
         ("running".to_string(), "running".to_string()),
@@ -557,7 +704,10 @@ async fn a_stale_close_cannot_end_a_newer_attempt() -> Result<()> {
     .bind(stale as i64)
     .fetch_one(store.pool())
     .await?;
-    assert!(ended.is_some(), "the stale attempt's audit row must still be closed");
+    assert!(
+        ended.is_some(),
+        "the stale attempt's audit row must still be closed"
+    );
 
     // And the live attempt still closes normally.
     assert!(store.finish_step(close(live)).await?.advanced);
@@ -574,7 +724,10 @@ async fn a_stale_park_cannot_hold_a_newer_attempt() -> Result<()> {
     let spec = one_step_spec("owned", now, OnInterrupt::Hold, false);
     let (job, run) = submit_one(&store, &spec, &now).await?;
     let (stale, live) = stale_and_live_attempt(&store, job, run, &now).await?;
-    let notify = NotifySpec { title: "parked".into(), body: "b".into() };
+    let notify = NotifySpec {
+        title: "parked".into(),
+        body: "b".into(),
+    };
 
     store
         .hold_run(
@@ -584,7 +737,10 @@ async fn a_stale_park_cannot_hold_a_newer_attempt() -> Result<()> {
             HeldReason::Errored,
             &notify,
             &now,
-            Some(Claim { step: "main", attempt: stale }),
+            Some(Claim {
+                step: "main",
+                attempt: stale,
+            }),
         )
         .await?;
     assert_eq!(
@@ -592,12 +748,14 @@ async fn a_stale_park_cannot_hold_a_newer_attempt() -> Result<()> {
         ("running".to_string(), "running".to_string()),
         "a live attempt must not be parked by an older one's exhausted retries"
     );
-    let queued: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM notifications WHERE job_id = ?")
-            .bind(job.0)
-            .fetch_one(store.pool())
-            .await?;
-    assert_eq!(queued, 0, "no on_hold notification for a park that didn't happen");
+    let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications WHERE job_id = ?")
+        .bind(job.0)
+        .fetch_one(store.pool())
+        .await?;
+    assert_eq!(
+        queued, 0,
+        "no on_hold notification for a park that didn't happen"
+    );
 
     // The live attempt can still park itself.
     store
@@ -608,7 +766,10 @@ async fn a_stale_park_cannot_hold_a_newer_attempt() -> Result<()> {
             HeldReason::Errored,
             &notify,
             &now,
-            Some(Claim { step: "main", attempt: live }),
+            Some(Claim {
+                step: "main",
+                attempt: live,
+            }),
         )
         .await?;
     assert_eq!(run_state(&store, job, run).await.0, "held");
@@ -627,11 +788,29 @@ async fn a_stale_claim_is_not_current_so_it_never_spawns() -> Result<()> {
     let (stale, live) = stale_and_live_attempt(&store, job, run, &now).await?;
 
     assert!(
-        !store.claim_is_current(job, run, Claim { step: "main", attempt: stale }).await?,
+        !store
+            .claim_is_current(
+                job,
+                run,
+                Claim {
+                    step: "main",
+                    attempt: stale
+                }
+            )
+            .await?,
         "the stale attempt must not spawn against a newer attempt's cursor"
     );
     assert!(
-        store.claim_is_current(job, run, Claim { step: "main", attempt: live }).await?,
+        store
+            .claim_is_current(
+                job,
+                run,
+                Claim {
+                    step: "main",
+                    attempt: live
+                }
+            )
+            .await?,
         "the live attempt's own claim must still read as current"
     );
     Ok(())
@@ -654,7 +833,10 @@ async fn a_stale_deadline_cannot_fail_a_newer_attempt() -> Result<()> {
             "main",
             &now,
             None,
-            Some(Claim { step: "main", attempt: stale }),
+            Some(Claim {
+                step: "main",
+                attempt: stale,
+            }),
         )
         .await?;
     assert!(outcome.is_none(), "a stale deadline must decide nothing");

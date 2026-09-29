@@ -197,9 +197,9 @@ impl Spawner for SystemSpawner {
             });
         }
 
-        let mut child = command.spawn().with_context(|| {
-            format!("spawning {:?} in {:?}", request.argv[0], request.cwd)
-        })?;
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("spawning {:?} in {:?}", request.argv[0], request.cwd))?;
         // After setsid, the child's pid IS the process-group (and session) id.
         let pgid = child.id().context("spawned child has no pid")? as i32;
 
@@ -207,10 +207,16 @@ impl Spawner for SystemSpawner {
         let stderr_tail = Arc::new(Mutex::new(Vec::new()));
         let stdout_pipe = child.stdout.take().expect("stdout was piped");
         let stderr_pipe = child.stderr.take().expect("stderr was piped");
-        let stdout_task =
-            tokio::spawn(drain(stdout_pipe, Arc::clone(&log), Arc::clone(&stdout_tail)));
-        let stderr_task =
-            tokio::spawn(drain(stderr_pipe, Arc::clone(&log), Arc::clone(&stderr_tail)));
+        let stdout_task = tokio::spawn(drain(
+            stdout_pipe,
+            Arc::clone(&log),
+            Arc::clone(&stdout_tail),
+        ));
+        let stderr_task = tokio::spawn(drain(
+            stderr_pipe,
+            Arc::clone(&log),
+            Arc::clone(&stderr_tail),
+        ));
 
         // Wait, racing the two kill triggers (§2.3): the step's own timeout
         // and the cancellation handle. Both end in the same §2.2 sequence —
@@ -421,7 +427,10 @@ mod tests {
         assert_eq!(result.stderr, "err\n");
         // …and one merged log file holding both.
         let merged = std::fs::read_to_string(&log)?;
-        assert!(merged.contains("out\n") && merged.contains("err\n"), "{merged:?}");
+        assert!(
+            merged.contains("out\n") && merged.contains("err\n"),
+            "{merged:?}"
+        );
         // §7.5: log file is 0600.
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&log)?.permissions().mode() & 0o777, 0o600);
@@ -435,10 +444,7 @@ mod tests {
         // The step spawns a backgrounded grandchild; if only the direct
         // child were killed, the grandchild would survive to write the
         // marker after the step "ended" (§2.2's leak).
-        let script = format!(
-            "(sleep 2; touch {}) & sleep 10",
-            marker.display()
-        );
+        let script = format!("(sleep 2; touch {}) & sleep 10", marker.display());
         let mut req = request(&["/bin/sh", "-c", &script], dir.path().join("t.log"));
         req.timeout = Some(SignedDuration::from_millis(300));
 
@@ -447,7 +453,10 @@ mod tests {
 
         assert!(result.timed_out);
         assert_eq!(result.exit_code, None, "killed by signal → no exit code");
-        assert!(started.elapsed() < Duration::from_secs(5), "TERM→grace→KILL, not the full sleep");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "TERM→grace→KILL, not the full sleep"
+        );
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert!(!marker.exists(), "grandchild escaped the group kill");
         Ok(())
@@ -474,16 +483,26 @@ mod tests {
         // Grace (200ms) after the timeout (300ms), plus the KILL and drain —
         // not DRAIN_GRACE's 5s, which is what waiting on a survivor's pipes
         // would cost.
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(!marker.exists(), "TERM-ignoring grandchild outlived the teardown");
+        assert!(
+            !marker.exists(),
+            "TERM-ignoring grandchild outlived the teardown"
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn a_cooperative_group_returns_without_waiting_out_the_grace() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let mut req = request(&["/bin/sh", "-c", "sleep 10 & sleep 10"], dir.path().join("t.log"));
+        let mut req = request(
+            &["/bin/sh", "-c", "sleep 10 & sleep 10"],
+            dir.path().join("t.log"),
+        );
         req.timeout = Some(SignedDuration::from_millis(100));
         req.kill_grace = SignedDuration::from_secs(5);
 
@@ -493,7 +512,11 @@ mod tests {
         assert!(result.timed_out);
         // Every member exits on TERM, so the group empties long before the
         // 5s grace — watching the group must not turn into sleeping it out.
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
         Ok(())
     }
 
@@ -505,7 +528,11 @@ mod tests {
     async fn a_stopped_step_still_gets_its_grace() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut req = request(
-            &["/bin/sh", "-c", "trap 'exit 7' TERM; kill -STOP $$; sleep 10"],
+            &[
+                "/bin/sh",
+                "-c",
+                "trap 'exit 7' TERM; kill -STOP $$; sleep 10",
+            ],
             dir.path().join("t.log"),
         );
         req.timeout = Some(SignedDuration::from_millis(300));
@@ -516,7 +543,11 @@ mod tests {
 
         assert!(result.timed_out);
         assert_eq!(result.exit_code, Some(7), "the TERM handler never ran");
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
         Ok(())
     }
 
@@ -533,7 +564,9 @@ mod tests {
             "setsid /bin/sh -c 'echo $$ > {}; while :; do echo x; sleep 0.05; done' &",
             pid_file.display()
         );
-        let result = SystemSpawner.run(request(&["/bin/sh", "-c", &script], log.clone())).await;
+        let result = SystemSpawner
+            .run(request(&["/bin/sh", "-c", &script], log.clone()))
+            .await;
 
         let escapee: i32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
         let before = std::fs::metadata(&log)?.len();

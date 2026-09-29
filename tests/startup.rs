@@ -35,9 +35,16 @@ impl Sandbox {
         // `any_installed` consults crontab during auto-spawn; keep the host's
         // crontab out of it.
         let crontab = root.path().join("fakebin/crontab");
-        std::fs::write(&crontab, "#!/bin/sh\necho 'no crontab for test' >&2\nexit 1\n").unwrap();
-        std::fs::set_permissions(&crontab, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .unwrap();
+        std::fs::write(
+            &crontab,
+            "#!/bin/sh\necho 'no crontab for test' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &crontab,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let token = format!(
             "startup-{}-{}",
             std::process::id(),
@@ -60,7 +67,10 @@ impl Sandbox {
         command
             .env_clear()
             .env("HOME", self.path("home"))
-            .env("PATH", format!("{}:/usr/bin:/bin", self.path("fakebin").display()))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.path("fakebin").display()),
+            )
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("XDG_DATA_HOME", self.path(data))
             .env("CUED_SOCKET_DIR", self.path("sock"))
@@ -98,7 +108,10 @@ impl Sandbox {
             let Ok(environ) = std::fs::read(entry.path().join("environ")) else {
                 continue;
             };
-            if environ.split(|b| *b == 0).any(|var| var == needle.as_bytes()) {
+            if environ
+                .split(|b| *b == 0)
+                .any(|var| var == needle.as_bytes())
+            {
                 pids.push(pid);
             }
         }
@@ -167,10 +180,16 @@ fn a_daemon_for_another_data_dir_cannot_take_over_a_live_socket() {
     let mut second = sandbox.foreground_daemon("data-b");
     let status = wait_exit(&mut second, Duration::from_secs(10))
         .expect("the second daemon must refuse the socket, not keep running");
-    assert!(!status.success(), "losing the socket lock is a startup failure");
+    assert!(
+        !status.success(),
+        "losing the socket lock is a startup failure"
+    );
     let mut stderr = String::new();
     std::io::Read::read_to_string(&mut second.stderr.take().unwrap(), &mut stderr).unwrap();
-    assert!(stderr.contains("another cued daemon is serving"), "{stderr}");
+    assert!(
+        stderr.contains("another cued daemon is serving"),
+        "{stderr}"
+    );
 
     assert_eq!(
         std::fs::metadata(sandbox.socket()).unwrap().ino(),
@@ -194,7 +213,10 @@ fn a_killed_daemons_socket_and_locks_do_not_block_the_next_one() {
     wait_for_socket(&sandbox.socket(), &mut first);
     first.kill().unwrap();
     first.wait().unwrap();
-    assert!(sandbox.socket().exists(), "SIGKILL leaves the socket file behind");
+    assert!(
+        sandbox.socket().exists(),
+        "SIGKILL leaves the socket file behind"
+    );
     assert!(UnixStream::connect(sandbox.socket()).is_err());
 
     let mut next = sandbox.foreground_daemon("data");

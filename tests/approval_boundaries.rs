@@ -324,7 +324,6 @@ async fn late_sweep_records_the_deadline_not_the_sweep_time() -> Result<()> {
     Ok(())
 }
 
-
 #[tokio::test]
 async fn cancel_waiting_for_the_writer_preserves_elapsed_expiry() -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -338,7 +337,11 @@ async fn cancel_waiting_for_the_writer_preserves_elapsed_expiry() -> Result<()> 
     let clock_read = AtomicBool::new(false);
     let cancel = store.cancel_job_with_clock(job, || {
         clock_read.store(true, Ordering::SeqCst);
-        if elapsed.load(Ordering::SeqCst) { deadline } else { nanos(deadline, -1) }
+        if elapsed.load(Ordering::SeqCst) {
+            deadline
+        } else {
+            nanos(deadline, -1)
+        }
     });
     tokio::pin!(cancel);
     tokio::select! {
