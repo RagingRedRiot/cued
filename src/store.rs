@@ -26,7 +26,7 @@ use crate::model::{
     Approval, ApprovalState, CatchUp, DeliveryReceipt, ExpiryReason, Graph, HeldReason, Hooks, Job,
     JobId, JobSource, JobSpec, JobStatus, NotifySpec, Policies, RunId, RunStatus, Schedule, StepId,
 };
-use crate::proto::LogAttempt;
+use crate::proto::{JobRun, LogAttempt, RunEntry, RunQuery};
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -170,6 +170,15 @@ pub struct RunOverview {
     pub cursor_at: Option<Timestamp>,
     pub fail_reason: Option<String>,
 }
+
+/// An Active job with nothing left to do: nothing armed or queued, not
+/// awaiting approval, and no run still in flight. The one rule for "this
+/// job is done" — `finish_exhausted_jobs` acts on it, and `job_run` reports
+/// it before that sweep comes round. Expects `jobs` in scope.
+const EXHAUSTED: &str = "jobs.status = 'active'
+    AND jobs.next_fire_at IS NULL AND jobs.queued_at IS NULL
+    AND (jobs.approval IS NULL OR json_extract(jobs.approval, '$.state') = 'approved')
+    AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.job_id = jobs.id AND runs.cursor_kind != 'done')";
 
 /// The result of trying to record a §4.2 firing.
 #[derive(Debug, PartialEq, Eq)]
@@ -348,7 +357,7 @@ impl Store {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(spec.name.as_deref())
-        .bind(job_status_text(JobStatus::Active))
+        .bind(JobStatus::Active.as_str())
         .bind(serde_json::to_string(&spec.schedule)?)
         .bind(next_fire_at)
         .bind(serde_json::to_string(&spec.graph)?)
@@ -386,7 +395,7 @@ impl Store {
             .bind(job.0)
             .bind(run.0)
             .bind(to_ts(&first_fire))
-            .bind(run_status_text(RunStatus::Pending))
+            .bind(RunStatus::Pending.as_str())
             .bind(&spec.graph.entry)
             .bind(to_ts(&first_fire))
             .execute(&mut *tx)
@@ -428,12 +437,9 @@ impl Store {
     /// example, catch_up=skip with an `until` that elapsed during approval).
     /// Paused jobs retain their lifecycle; pending definitions cannot end here.
     pub async fn finish_exhausted_jobs(&self) -> Result<()> {
-        sqlx::query(
-            "UPDATE jobs SET status = 'done'
-            WHERE status = 'active' AND next_fire_at IS NULL AND queued_at IS NULL
-            AND (approval IS NULL OR json_extract(approval, '$.state') = 'approved')
-            AND NOT EXISTS (SELECT 1 FROM runs WHERE job_id = jobs.id AND cursor_kind != 'done')",
-        )
+        sqlx::query(&format!(
+            "UPDATE jobs SET status = 'done' WHERE {EXHAUSTED}"
+        ))
         .execute(&self.writer)
         .await?;
         Ok(())
@@ -598,7 +604,7 @@ impl Store {
                     cursor_at = NULL, started_at = COALESCE(started_at, ?)
              WHERE job_id = ? AND id = ? AND cursor_kind = 'waiting' AND cursor_step = ?",
         )
-        .bind(run_status_text(RunStatus::Running))
+        .bind(RunStatus::Running.as_str())
         .bind(step)
         .bind(to_ts(now))
         .bind(job.0)
@@ -687,7 +693,7 @@ impl Store {
                     "UPDATE runs SET status = ?, cursor_kind = 'waiting', cursor_step = ?, cursor_at = ?
                      WHERE job_id = ? AND id = ? {OWNS_CURSOR}"
                 ))
-                .bind(run_status_text(RunStatus::Waiting))
+                .bind(RunStatus::Waiting.as_str())
                 .bind(step)
                 .bind(to_ts(at))
                 .bind(close.job.0)
@@ -709,7 +715,7 @@ impl Store {
                             cursor_at = NULL, ended_at = ?, fail_reason = ?
                      WHERE job_id = ? AND id = ? {OWNS_CURSOR}"
                 ))
-                .bind(run_status_text(*status))
+                .bind(status.as_str())
                 .bind(to_ts(close.ended_at))
                 .bind(fail_reason.as_deref())
                 .bind(close.job.0)
@@ -937,7 +943,7 @@ impl Store {
              WHERE job_id = ? AND id = ? {guard}"
         );
         let mut query = sqlx::query(&sql)
-            .bind(run_status_text(RunStatus::Held))
+            .bind(RunStatus::Held.as_str())
             .bind(step)
             .bind(held_reason_text(reason))
             .bind(job.0)
@@ -985,7 +991,7 @@ impl Store {
                     cursor_at = NULL, ended_at = ?
              WHERE job_id = ? AND id = ?",
         )
-        .bind(run_status_text(RunStatus::Missed))
+        .bind(RunStatus::Missed.as_str())
         .bind(to_ts(now))
         .bind(job.0)
         .bind(run.0)
@@ -1057,7 +1063,7 @@ impl Store {
              WHERE job_id = ? AND id = ? {guard}"
         );
         let mut query = sqlx::query(&sql)
-            .bind(run_status_text(RunStatus::Failed))
+            .bind(RunStatus::Failed.as_str())
             .bind(to_ts(now))
             .bind(job.0)
             .bind(run.0);
@@ -1134,7 +1140,7 @@ impl Store {
             "UPDATE runs SET status = ?, cursor_kind = 'waiting', cursor_step = ?, cursor_at = ?
              WHERE job_id = ? AND id = ?",
         )
-        .bind(run_status_text(RunStatus::Waiting))
+        .bind(RunStatus::Waiting.as_str())
         .bind(step)
         .bind(to_ts(at))
         .bind(job.0)
@@ -1171,7 +1177,7 @@ impl Store {
             "UPDATE runs SET status = ?, cursor_kind = 'waiting', cursor_at = ?, held_reason = NULL
              WHERE job_id = ? AND id = ?",
         )
-        .bind(run_status_text(RunStatus::Waiting))
+        .bind(RunStatus::Waiting.as_str())
         .bind(to_ts(at))
         .bind(job.0)
         .bind(run.0)
@@ -1235,7 +1241,7 @@ impl Store {
                     ended_at = NULL, fail_reason = NULL, held_reason = NULL, epoch = epoch + 1
              WHERE job_id = ? AND id = ?",
         )
-        .bind(run_status_text(RunStatus::Pending))
+        .bind(RunStatus::Pending.as_str())
         .bind(step)
         .bind(to_ts(at))
         .bind(job.0)
@@ -1243,7 +1249,7 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE jobs SET status = ? WHERE id = ? AND status IN ('done', 'cancelled')")
-            .bind(job_status_text(JobStatus::Active))
+            .bind(JobStatus::Active.as_str())
             .bind(job.0)
             .execute(&mut *tx)
             .await?;
@@ -1400,7 +1406,7 @@ impl Store {
             .bind(firing.job.0)
             .bind(id)
             .bind(to_ts(to))
-            .bind(run_status_text(RunStatus::Skipped))
+            .bind(RunStatus::Skipped.as_str())
             .bind(to_ts(firing.now))
             .bind(from.map(to_ts))
             .bind(count)
@@ -1418,7 +1424,7 @@ impl Store {
             .bind(firing.job.0)
             .bind(id)
             .bind(to_ts(at))
-            .bind(run_status_text(RunStatus::Pending))
+            .bind(RunStatus::Pending.as_str())
             .bind(firing.entry_step)
             .bind(to_ts(at))
             .execute(&mut *tx)
@@ -1525,7 +1531,7 @@ impl Store {
         .bind(job.0)
         .bind(id)
         .bind(&at_text)
-        .bind(run_status_text(RunStatus::Pending))
+        .bind(RunStatus::Pending.as_str())
         .bind(entry_step)
         .bind(&at_text)
         .execute(&mut **tx)
@@ -1627,7 +1633,7 @@ impl Store {
             }
         }
         sqlx::query("UPDATE jobs SET status = ? WHERE id = ?")
-            .bind(job_status_text(JobStatus::Paused))
+            .bind(JobStatus::Paused.as_str())
             .bind(job.0)
             .execute(&mut *tx)
             .await?;
@@ -1686,7 +1692,7 @@ impl Store {
                     cursor_at = NULL, held_reason = NULL, ended_at = ?
              WHERE job_id = ? AND cursor_kind != 'done'",
         )
-        .bind(run_status_text(RunStatus::Cancelled))
+        .bind(RunStatus::Cancelled.as_str())
         .bind(to_ts(now))
         .bind(job.0)
         .execute(&mut *tx)
@@ -1697,7 +1703,7 @@ impl Store {
         sqlx::query(
             "UPDATE jobs SET status = ?, next_fire_at = NULL, queued_at = NULL WHERE id = ?",
         )
-        .bind(job_status_text(JobStatus::Cancelled))
+        .bind(JobStatus::Cancelled.as_str())
         .bind(job.0)
         .execute(&mut *tx)
         .await?;
@@ -1736,7 +1742,7 @@ impl Store {
         // past occurrence — "resume never back-fills" (§4.2) has to mean the
         // queue as well as the schedule.
         sqlx::query("UPDATE jobs SET status = ?, next_fire_at = ?, queued_at = NULL WHERE id = ?")
-            .bind(job_status_text(JobStatus::Active))
+            .bind(JobStatus::Active.as_str())
             .bind(next_fire_at.map(to_ts))
             .bind(job.0)
             .execute(&mut *tx)
@@ -2112,6 +2118,124 @@ impl Store {
         Ok((run, attempts))
     }
 
+    /// `cued wait`'s poll: where the job stands and the run `query` asks
+    /// for. Read-only.
+    ///
+    /// `Latest` and `After` pass over `Skipped` rows. They record firings
+    /// that didn't execute, and they are written with ids above the run
+    /// they deferred to — after a live run under `overlap = skip`, and just
+    /// before the executing run in a catch-up — so taking one as "the run"
+    /// would report a skip while the real run is still going. `Exact`
+    /// returns the row asked for, whatever it is.
+    ///
+    /// Returns the reply without step results, and whether the job awaits
+    /// approval (so may be due to expire).
+    pub async fn job_run(&self, job: JobId, query: RunQuery) -> Result<(JobRun, bool)> {
+        // `last_id` is the high-water mark `next_run_id` allocates from, not
+        // the rows that remain: retention can prune a job's newest runs,
+        // and a pruned run must not look like one not created yet.
+        let row = sqlx::query(&format!(
+            "SELECT status, next_fire_at, queued_at IS NOT NULL AS queued,
+                    next_fire_at IS NOT NULL OR queued_at IS NOT NULL AS armed,
+                    COALESCE(json_extract(approval, '$.state') = 'pending', 0) AS pending,
+                    {EXHAUSTED} AS exhausted,
+                    MAX(run_seq, (SELECT COALESCE(MAX(id), 0) FROM runs
+                                  WHERE job_id = jobs.id)) AS last_id
+             FROM jobs WHERE id = ?"
+        ))
+        .bind(job.0)
+        .fetch_one(&self.reader)
+        .await?;
+        let stored = job_status(row.get("status"))?;
+        let pending = stored.is_live() && row.get::<i64, _>("pending") != 0;
+        // Paused keeps its arming (resume re-arms from it), so the same test
+        // holds for it as for Active.
+        let more = stored.is_live() && (row.get::<i64, _>("armed") != 0 || pending);
+        // An exhausted job stays Active until `finish_exhausted_jobs` marks
+        // it Done, by the same `EXHAUSTED` rule. Report what it is about to be.
+        let status = if row.get::<i64, _>("exhausted") != 0 {
+            JobStatus::Done
+        } else {
+            stored
+        };
+        let queued = row.get::<i64, _>("queued") != 0;
+        let next_fire_at = row
+            .get::<Option<&str>, _>("next_fire_at")
+            .map(from_ts)
+            .transpose()?;
+
+        const COLUMNS: &str = "id, status, ended_at, fail_reason, cursor_kind, cursor_at";
+        let run = match query {
+            RunQuery::Latest => {
+                sqlx::query(&format!(
+                    "SELECT {COLUMNS} FROM runs WHERE job_id = ? AND status != 'skipped'
+                     ORDER BY id DESC LIMIT 1"
+                ))
+                .bind(job.0)
+                .fetch_optional(&self.reader)
+                .await?
+            }
+            RunQuery::Exact(id) => {
+                sqlx::query(&format!(
+                    "SELECT {COLUMNS} FROM runs WHERE job_id = ? AND id = ?"
+                ))
+                .bind(job.0)
+                .bind(id)
+                .fetch_optional(&self.reader)
+                .await?
+            }
+            RunQuery::After(id) => {
+                sqlx::query(&format!(
+                    "SELECT {COLUMNS} FROM runs WHERE job_id = ? AND id > ? AND status != 'skipped'
+                     ORDER BY id LIMIT 1"
+                ))
+                .bind(job.0)
+                .bind(id)
+                .fetch_optional(&self.reader)
+                .await?
+            }
+        };
+
+        let mut quiet_until = None;
+        let run = match run {
+            Some(row) => {
+                if row.get::<&str, _>("cursor_kind") == "waiting" {
+                    quiet_until = row
+                        .get::<Option<&str>, _>("cursor_at")
+                        .map(from_ts)
+                        .transpose()?;
+                }
+                Some(RunEntry {
+                    id: RunId(row.get("id")),
+                    status: run_status(row.get("status"))?,
+                    ended_at: row
+                        .get::<Option<&str>, _>("ended_at")
+                        .map(from_ts)
+                        .transpose()?,
+                    fail_reason: row.get("fail_reason"),
+                })
+            }
+            None => {
+                // A queued firing starts the moment the run ahead of it
+                // ends, not at the next scheduled instant.
+                if more && !pending && !queued {
+                    quiet_until = next_fire_at;
+                }
+                None
+            }
+        };
+        let reply = JobRun {
+            job,
+            status,
+            more,
+            run,
+            last_id: row.get("last_id"),
+            quiet_until,
+            steps: None,
+        };
+        Ok((reply, pending))
+    }
+
     /// The `cued list` view (§10.3): every job joined with its latest run;
     /// default scope is live jobs plus runs that ended in the last 24h
     /// (Held always shown), `all` shows everything retained.
@@ -2425,25 +2549,8 @@ fn from_ts(text: &str) -> Result<Timestamp> {
         .with_context(|| format!("bad stored timestamp {text:?}"))
 }
 
-fn job_status_text(status: JobStatus) -> &'static str {
-    match status {
-        JobStatus::Active => "active",
-        JobStatus::Paused => "paused",
-        JobStatus::Done => "done",
-        JobStatus::Cancelled => "cancelled",
-        JobStatus::Expired => "expired",
-    }
-}
-
 fn job_status(text: &str) -> Result<JobStatus> {
-    Ok(match text {
-        "active" => JobStatus::Active,
-        "paused" => JobStatus::Paused,
-        "done" => JobStatus::Done,
-        "cancelled" => JobStatus::Cancelled,
-        "expired" => JobStatus::Expired,
-        other => bail!("bad stored job status {other:?}"),
-    })
+    JobStatus::parse(text).with_context(|| format!("bad stored job status {text:?}"))
 }
 
 fn held_reason_text(reason: HeldReason) -> &'static str {
@@ -2453,33 +2560,8 @@ fn held_reason_text(reason: HeldReason) -> &'static str {
     }
 }
 
-fn run_status_text(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Pending => "pending",
-        RunStatus::Running => "running",
-        RunStatus::Waiting => "waiting",
-        RunStatus::Held => "held",
-        RunStatus::Done => "done",
-        RunStatus::Failed => "failed",
-        RunStatus::Missed => "missed",
-        RunStatus::Skipped => "skipped",
-        RunStatus::Cancelled => "cancelled",
-    }
-}
-
 fn run_status(text: &str) -> Result<RunStatus> {
-    Ok(match text {
-        "pending" => RunStatus::Pending,
-        "running" => RunStatus::Running,
-        "waiting" => RunStatus::Waiting,
-        "held" => RunStatus::Held,
-        "done" => RunStatus::Done,
-        "failed" => RunStatus::Failed,
-        "missed" => RunStatus::Missed,
-        "skipped" => RunStatus::Skipped,
-        "cancelled" => RunStatus::Cancelled,
-        other => bail!("bad stored run status {other:?}"),
-    })
+    RunStatus::parse(text).with_context(|| format!("bad stored run status {text:?}"))
 }
 
 #[cfg(test)]

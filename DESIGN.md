@@ -345,6 +345,56 @@ CLI list, show, logs, and JSON output support inspection. Run and attempt record
 retain outcome and timing information. MCP exports a restricted projection of
 that state; bounded log tails report truncation.
 
+`cued wait` (and `--wait` on `at`, `chain`, and `submit`) blocks until a run
+settles, meaning done, failed, held, cancelled, or missed, and exits with a
+status that encodes the outcome. A held run counts as settled because it
+needs a decision. `Skipped` rows are passed over: they record firings that
+didn't execute, and they are written with ids above the run they deferred
+to. Exit codes avoid 1 (cued error) and 2 (usage). A `--wait` whose wait
+fails after submission has its own code, so a retry doesn't resubmit.
+
+It polls the daemon about once a second, by job id after the first request.
+When the reply says nothing can change on its own until later (a waiting
+run's wake time, or the job's next firing), it sleeps toward that instead, up
+to 30 seconds at a time, so commands such as cancel are still noticed. On a
+paused job, a step that is executing is waited out, since it finishes
+regardless; anything that would need the job to move (the next step, a run
+not yet started or created) is refused, since a paused job starts none of
+it. `--wait` asks the daemon whether it would answer before submitting, so
+a refused wait never leaves a job behind. A status reply that arrives after
+`--timeout` counts as a timeout; an error reply is passed through whenever
+it arrives. `--run N` looks up that exact row, including a Skipped one; the
+reply's highest run id tells a run not created yet from one that is gone.
+Polls are reads and never take the writer; a lapsed approval is the
+scheduler's to expire, and while one is pending the waiter naps toward its
+deadline. The daemon includes step results in the reply only for
+a settled run, so reporting needs no further requests. The waiter rides out
+up to a minute of the daemon being unreachable, which covers a restart or an
+upgrade that keeps the wire protocol. Across one that changes it, the old
+waiter can't read the new daemon, so it stops with an error and the run
+carries on; `cued wait` from the new binary picks it up. Each exchange (connect, request, reply) has one absolute bound:
+10 seconds, or less if `--timeout` ends sooner. The connect, every write, and
+every read get only what is left of it, so neither a full accept queue nor a
+reply arriving piece by piece can stretch it. The connect is nonblocking,
+because a blocking connect waits without limit on a full queue. A reply that
+arrives after `--timeout`, and a run that settles after it, count as a
+timeout, and the pause between polls is clamped to the deadline.
+With no daemon running, `wait` exits 1 rather than time out, since nothing
+would finish the run. A bad `--timeout` is a usage error (2).
+
+It is meant as the single shell command an agent restricted to MCP may run
+(§7.6), so it reports no more than MCP would: the outcome under `read`,
+per-step exit codes and timing under `logs`, and never captured output or
+environment. The daemon enforces both switches on every poll, from its own
+environment, because the waiter's shell is exactly where an override could
+be planted. For this check the settings only tighten: `off` in any policy
+file or in the environment wins, and nothing reopens it. For the same reason
+`wait` never auto-spawns a daemon: one started from the waiter's shell would
+inherit that shell's environment. The daemon can't see a policy set only in
+an MCP server's launch environment, so `cued mcp` warns at startup when that
+makes `wait` looser than the server. MCP itself has no wait tool, because a
+blocking call would hold the client's session.
+
 ## 11. Tests
 
 Automated tests cover scheduling, recurrence, approval boundaries, workflow

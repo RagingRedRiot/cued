@@ -81,6 +81,12 @@ pub enum RequestBody {
         step: Option<String>,
         attempt: Option<u32>,
     },
+    /// `cued wait`: where a job and one of its runs stand. Refused while
+    /// MCP `read` is off.
+    Runs { job: String, run: RunQuery },
+    /// `--wait`'s check before submitting: whether `Runs` would be refused,
+    /// so a job is never created only to be refused a wait.
+    WaitAllowed,
     /// §5.2 upgrade: finish the running steps, then re-exec the binary this
     /// daemon was started from, keeping its PID, locks and listening socket.
     ///
@@ -152,6 +158,10 @@ pub enum Response {
         run: RunId,
         attempts: Vec<LogAttempt>,
     },
+    /// Reply to `Runs`. Boxed: it dwarfs the other replies.
+    JobRun(Box<JobRun>),
+    /// Reply to `WaitAllowed` when it is.
+    WaitAllowed,
     /// The job is cancelled; `runs` are the runs that were live and have
     /// been marked `Cancelled` (their processes, if any, are being torn
     /// down per §2.2 — the reply doesn't wait out `kill_grace`).
@@ -199,6 +209,51 @@ pub struct JobEntry {
     /// job's re-arm target (§4.2).
     pub next_at: Option<Timestamp>,
     pub last_run: Option<RunEntry>,
+}
+
+/// Which run a `Runs` poll asks about. `Latest` and `After` pass over
+/// `Skipped` rows — they record firings that never ran, written with ids
+/// above the run they deferred to — while `Exact` returns whatever that
+/// row is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunQuery {
+    Latest,
+    Exact(i64),
+    /// The first run with a higher id.
+    After(i64),
+}
+
+/// Where a job stands for `cued wait`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JobRun {
+    pub job: JobId,
+    /// Effective: a live job with nothing left to run and no run in flight
+    /// reads as Done — the sweep's own rule — though the store keeps it
+    /// Active until that sweep.
+    pub status: JobStatus,
+    /// The job can still create a run: it is live and armed, queued, or
+    /// awaiting approval.
+    pub more: bool,
+    pub run: Option<RunEntry>,
+    /// The job's highest run id, Skipped rows included (0: none yet). An
+    /// `Exact` run above it hasn't been created yet.
+    pub last_id: i64,
+    /// Nothing changes on its own before this: a waiting run's wake time,
+    /// or, with no run, the job's next firing. `None`: any moment. Only
+    /// commands (cancel, retry…) can act sooner.
+    pub quiet_until: Option<Timestamp>,
+    /// How a settled run's steps went — only while MCP `logs` is on, which
+    /// is what governs per-step results.
+    pub steps: Option<RunSteps>,
+}
+
+/// A settled run's attempts, for `cued wait`'s summary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RunSteps {
+    pub attempts: Vec<LogAttempt>,
+    /// Which steps notify, so their attempts read "notified", not "killed".
+    pub notify: std::collections::BTreeSet<StepId>,
 }
 
 /// One attempt's log metadata (§2.1). The captured bytes are pointedly NOT
