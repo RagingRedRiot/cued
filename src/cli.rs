@@ -22,11 +22,16 @@ pub enum Command {
         /// When to run (§9 grammar: "9am tomorrow", "in 90m", "2026-06-25 09:00")
         time: String,
         /// The command. After `--`: argv, exec'd directly. As a single
-        /// quoted string (no `--`): run via `sh -c` (§2.2).
+        /// quoted string (no `--`): run via `sh -c` (§2.2). Everything from
+        /// here on is the command, so cued's own flags go before TIME.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
         #[command(flatten)]
         common: SubmitCommon,
+        /// Block until the run ends and exit with its outcome, as plain
+        /// `cued wait` would (`cued wait --timeout`/`--json` for scripts).
+        #[arg(long)]
+        wait: bool,
     },
 
     /// Schedule a notification: cued remind "1h" "stretch"
@@ -51,6 +56,8 @@ pub enum Command {
         /// anchored Every ("every 6h starting 9am", §4.1).
         #[arg(long)]
         at: Option<String>,
+        /// The command, as for `at`. Everything from here on is the
+        /// command, so cued's own flags go before SPEC.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
         #[command(flatten)]
@@ -71,6 +78,10 @@ pub enum Command {
         on_fail: String,
         #[command(flatten)]
         common: SubmitCommon,
+        /// Block until the chain ends and exit with its outcome, as plain
+        /// `cued wait` would (`cued wait --timeout`/`--json` for scripts).
+        #[arg(long)]
+        wait: bool,
     },
 
     /// Submit a TOML workflow file (§6.2)
@@ -85,6 +96,39 @@ pub enum Command {
         /// the machine's; a `zone` key in the file does the same (§9).
         #[arg(long, value_name = "IANA")]
         zone: Option<String>,
+        /// Block until the first run ends and exit with its outcome, as plain
+        /// `cued wait` would (`cued wait --timeout`/`--json` for scripts).
+        #[arg(long)]
+        wait: bool,
+    },
+
+    /// Block until a job's run ends; the exit status is its outcome
+    #[command(after_help = "\
+Waits for the run in progress, else the next one to fire. A Held run is
+reported at once: it needs `cued continue` or `cued retry`. Skipped firings
+are records, not runs, and are passed over; --run N means exactly that run,
+skipped or not yet created. On a paused job, an executing step is waited
+out; anything needing the job to move is refused. Never starts a daemon.
+
+Reports what MCP would: the outcome while MCP `read` is on (else the daemon
+refuses), each step's exit code only while `logs` is on, never captured
+output or environment. The daemon applies its own mcp.toml and environment;
+nothing set in this shell turns a switch back on.
+
+Exit status: 0 done, 3 failed, 4 held, 5 ended (cancelled / missed /
+expired / out of runs), 124 timed out, 1 cued error (including no daemon
+running), 2 usage error.
+With --wait on at/chain/submit, 6: submitted, but the wait failed.")]
+    Wait {
+        job: String,
+        /// Wait for this run instead.
+        #[arg(long)]
+        run: Option<i64>,
+        /// Give up after this long (§9 duration: "30m", "2h").
+        #[arg(long, value_parser = parse_timeout)]
+        timeout: Option<std::time::Duration>,
+        #[arg(long)]
+        json: bool,
     },
 
     /// What's pending (live jobs + recently ended runs; Held always shown)
@@ -204,6 +248,38 @@ pub struct SubmitCommon {
     /// (§9). Output is still shown in your own zone.
     #[arg(long, value_name = "IANA")]
     pub zone: Option<String>,
+}
+
+/// The long flags `subcommand` takes (`--wait`, `--name`, …), read from
+/// its definition so a check against them can't drift from it.
+pub fn long_flags(subcommand: &str) -> Vec<String> {
+    use clap::CommandFactory;
+    Cli::command()
+        .find_subcommand(subcommand)
+        .map(|command| {
+            command
+                .get_arguments()
+                .filter_map(|arg| arg.get_long())
+                .filter(|long| !matches!(*long, "help" | "version"))
+                .map(|long| format!("--{long}"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `cued wait --timeout`: checked here, so a bad value is a usage error
+/// (exit 2) like any other, never a cued failure (1) a wrapper might retry.
+fn parse_timeout(text: &str) -> Result<std::time::Duration, String> {
+    let timeout = crate::timeparse::parse_duration(text).map_err(|error| format!("{error:#}"))?;
+    if !timeout.is_positive() {
+        return Err("must be positive".into());
+    }
+    let timeout = timeout.unsigned_abs();
+    // A deadline is an Instant; one that can't be represented can't be met.
+    std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or("too long")?;
+    Ok(timeout)
 }
 
 #[derive(Debug, Args)]

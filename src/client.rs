@@ -5,7 +5,7 @@
 //! `cued logs` is the exception: it reads log files directly, no socket.
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -29,6 +29,7 @@ use crate::persist::{
 };
 use crate::proto::{
     JobEntry, LogAttempt, MAX_UPGRADE_WAIT_SECS, PROTO_VERSION, Request, RequestBody, Response,
+    RunQuery,
 };
 use crate::{submit, timeparse};
 
@@ -41,7 +42,8 @@ pub fn run(command: Command) -> Result<()> {
             time,
             command,
             common,
-        } => at(&paths, &time, command, common),
+            wait,
+        } => at(&paths, &time, command, common, wait),
         Command::Remind {
             args,
             every,
@@ -67,20 +69,29 @@ pub fn run(command: Command) -> Result<()> {
             first,
             on_fail,
             common,
+            wait,
             ..
-        } => chain(&paths, &first, &on_fail, common),
+        } => chain(&paths, &first, &on_fail, common, wait),
         Command::Submit {
             file,
             at,
             every,
             zone,
+            wait,
         } => submit_file(
             &paths,
             &file,
             at.as_deref(),
             every.as_deref(),
             zone.as_deref(),
+            wait,
         ),
+        Command::Wait {
+            job,
+            run,
+            timeout,
+            json,
+        } => wait(&paths, &job, run, timeout, json),
         Command::Logs {
             job,
             run,
@@ -157,7 +168,13 @@ fn approve(paths: &Paths, reference: String) -> Result<()> {
 // cued at "9am tomorrow" -- ./backup.sh (§6.1)
 // ---------------------------------------------------------------------------
 
-fn at(paths: &Paths, time: &str, command: Vec<String>, common: SubmitCommon) -> Result<()> {
+fn at(
+    paths: &Paths,
+    time: &str,
+    command: Vec<String>,
+    common: SubmitCommon,
+    wait: bool,
+) -> Result<()> {
     let config = Config::load(&paths.config_file)?;
     // §9: read the user's words in the zone they named, or their own.
     let zone = timeparse::resolve_zone(common.zone.as_deref())?;
@@ -168,6 +185,13 @@ fn at(paths: &Paths, time: &str, command: Vec<String>, common: SubmitCommon) -> 
     // its absence means the single-string sh -c form. clap swallows the
     // separator, so consult the raw args for it.
     let had_separator = std::env::args().any(|arg| arg == "--");
+    check_flag_placement(
+        "at",
+        "time",
+        "cued at --wait \"in 1h\" ./backup.sh",
+        &command,
+        had_separator,
+    );
     let argv = submit::desugar_shell(command, had_separator);
     let graph = submit::single_shell_graph(argv);
 
@@ -187,21 +211,63 @@ fn at(paths: &Paths, time: &str, command: Vec<String>, common: SubmitCommon) -> 
         hooks: Hooks::default(),
     };
 
+    if wait {
+        check_wait_allowed(paths)?;
+    }
     match request(
         paths,
         RequestBody::Submit {
             spec: Box::new(spec),
         },
     )? {
-        Response::Submitted { job, .. } => {
+        Response::Submitted { job, run, .. } => {
             // §9.1 echo rule: the resolved interpretation, always.
             println!(
                 "{job} scheduled for {}",
                 timeparse::describe_instant(&at, &now.timestamp(), &timeparse::local_zone())
             );
-            Ok(())
+            wait_after_submit(paths, wait, job, run)
         }
         other => fail_on(other),
+    }
+}
+
+/// `at` and `every` take everything from the command on as the command, so
+/// a cued flag typed after it silently becomes part of it: `cued at 9am
+/// ./backup.sh --wait` runs `./backup.sh --wait` and doesn't wait. Without
+/// `--` that's always a slip — refuse it as a usage error, before anything
+/// is submitted. After `--` the words are the command by definition (a
+/// script may well take `--name`), so only point it out.
+fn check_flag_placement(
+    subcommand: &str,
+    before: &str,
+    example: &str,
+    command: &[String],
+    had_separator: bool,
+) {
+    let flags = crate::cli::long_flags(subcommand);
+    let misplaced: Vec<&str> = command
+        .iter()
+        .filter_map(|arg| {
+            let name = arg.split('=').next()?;
+            flags.iter().any(|flag| flag == name).then_some(name)
+        })
+        .collect();
+    if misplaced.is_empty() {
+        return;
+    }
+    let list = misplaced.join(", ");
+    if had_separator {
+        eprintln!(
+            "cued: note: {list} after `--` goes to the command, not to cued — \
+             cued's flags go before the {before}"
+        );
+    } else {
+        eprintln!(
+            "cued: {list} came after the command, so it would become part of the \
+             command — cued's flags go before the {before}, e.g. `{example}`"
+        );
+        std::process::exit(2);
     }
 }
 
@@ -286,6 +352,13 @@ fn every(
     let schedule = submit::every_schedule(spec_text, at_flag, &now)?;
 
     let had_separator = std::env::args().any(|arg| arg == "--");
+    check_flag_placement(
+        "every",
+        "schedule",
+        "cued every --name sync 30m ./sync.sh",
+        &command,
+        had_separator,
+    );
     let argv = submit::desugar_shell(command, had_separator);
     let graph = submit::single_shell_graph(argv);
     let cwd = std::env::current_dir()
@@ -441,7 +514,7 @@ fn render_table(jobs: &[JobEntry], now: &Timestamp) -> String {
             .last_run
             .as_ref()
             .map(|run| {
-                let mut text = format!("{} {:?}", run.id, run.status).to_lowercase();
+                let mut text = format!("{} {}", run.id, run.status.as_str());
                 // §3.2 records *why* a run failed when the command itself
                 // didn't; showing "failed" alone hides the difference
                 // between a broken script and a blown deadline.
@@ -510,7 +583,11 @@ pub(crate) fn request(paths: &Paths, body: RequestBody) -> Result<Response> {
 
 /// One request, one reply, on a connection the caller chose.
 fn exchange(stream: &UnixStream, body: RequestBody) -> Result<Response> {
-    let response = exchange_raw(stream, body)?;
+    advise_on_rejection(exchange_raw(stream, body)?)
+}
+
+/// A request the daemon couldn't parse means it is an older build.
+fn advise_on_rejection(response: Response) -> Result<Response> {
     if let Response::Error { message } = &response
         && message.starts_with("bad request:")
     {
@@ -524,29 +601,115 @@ fn exchange(stream: &UnixStream, body: RequestBody) -> Result<Response> {
 /// `exchange` without translating a rejected request into advice, for the
 /// callers that know better what a rejection means.
 fn exchange_raw(stream: &UnixStream, body: RequestBody) -> Result<Response> {
-    let mut payload = serde_json::to_string(&Request {
+    decode_reply(&send_request(stream, body)?)
+}
+
+/// The transport half of an exchange: write the request, read one reply
+/// line. Any failure here is the connection's, not the daemon's answer.
+/// Bounded only by whatever timeouts the caller set on `stream`.
+fn send_request(stream: &UnixStream, body: RequestBody) -> Result<String> {
+    write_request(stream, body, None).context("writing to daemon")?;
+    match read_reply_line(stream, None) {
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => bail!("{error}"),
+        line => line.context("reading daemon reply"),
+    }
+}
+
+/// §5.1 request framing: one JSON object, newline-terminated. With
+/// `until`, every write gets only what's left of that one bound.
+fn write_request(
+    stream: &UnixStream,
+    body: RequestBody,
+    until: Option<std::time::Instant>,
+) -> std::io::Result<()> {
+    let mut payload = serde_json::to_vec(&Request {
         proto: PROTO_VERSION,
         body,
-    })?;
-    payload.push('\n');
-    (&*stream)
-        .write_all(payload.as_bytes())
-        .context("writing to daemon")?;
+    })
+    .map_err(std::io::Error::other)?;
+    payload.push(b'\n');
+    let mut rest = &payload[..];
+    while !rest.is_empty() {
+        if let Some(until) = until {
+            stream.set_write_timeout(Some(time_left(until)?))?;
+        }
+        match (&*stream).write(rest) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "daemon closed the connection",
+                ));
+            }
+            Ok(n) => rest = &rest[n..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
 
-    let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .context("reading daemon reply")?;
-    ensure!(
-        !line.is_empty(),
-        "daemon closed the connection without replying"
-    );
+/// §5.1 reply framing: everything up to the first newline. With `until`,
+/// every read gets only what's left of that one bound, so a reply that
+/// trickles in can't stretch it.
+fn read_reply_line(
+    stream: &UnixStream,
+    until: Option<std::time::Instant>,
+) -> std::io::Result<String> {
+    let mut line = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(until) = until {
+            stream.set_read_timeout(Some(time_left(until)?))?;
+        }
+        match (&*stream).read(&mut chunk) {
+            // Closed mid-reply: hand over what came, so the decoder can say
+            // what a cut-off reply usually means (an older daemon).
+            Ok(0) if !line.is_empty() => {
+                return String::from_utf8(line)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+            }
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "daemon closed the connection without replying",
+                ));
+            }
+            Ok(n) => {
+                // Only the new bytes can hold the newline.
+                let end = chunk[..n].iter().position(|byte| *byte == b'\n');
+                let start = line.len();
+                line.extend_from_slice(&chunk[..n]);
+                if let Some(end) = end {
+                    line.truncate(start + end + 1);
+                    return String::from_utf8(line).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    });
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// What's left before `until`, as a socket timeout. Never zero — a socket
+/// reads that as "no timeout" — so running out is `TimedOut` instead.
+fn time_left(until: std::time::Instant) -> std::io::Result<Duration> {
+    let left = until.saturating_duration_since(std::time::Instant::now());
+    if left.is_zero() {
+        Err(std::io::ErrorKind::TimedOut.into())
+    } else {
+        Ok(left)
+    }
+}
+
+fn decode_reply(line: &str) -> Result<Response> {
     // §5.1's version handshake covers a *declared* change. Pre-release the
     // wire shape moves without the number moving (deliberately — there is no
     // compatibility to retain yet), so the realistic cause of an undecodable
     // reply is a daemon still running older code. Say so, rather than leave
     // a serde error as the only clue.
-    let response: Response = serde_json::from_str(&line).context(
+    let response: Response = serde_json::from_str(line).context(
         "couldn't decode the daemon's reply — it is probably running an older          build than this CLI; stop the running `cued daemon` and rerun, and the          next command respawns it",
     )?;
     Ok(response)
@@ -585,9 +748,11 @@ fn connect_or_spawn(paths: &Paths) -> Result<UnixStream> {
             return Ok(stream);
         }
     }
-    // §10.3: this is the "exit 3" case once stable exit codes land. The
-    // daemon's own stderr goes to its log, so point there rather than
-    // leaving the user with nothing to read.
+    // Exit 1, like any cued failure. `cued wait` gives 3 and up to run
+    // outcomes, so a distinct "unreachable" code, if one ever lands, must
+    // come from outside that range. The daemon's own stderr goes to its
+    // log, so point there rather than leaving the user with nothing to
+    // read.
     bail!(
         "daemon unreachable at {} (auto-spawn didn't come up) — see {}",
         paths.socket_file.display(),
@@ -869,13 +1034,7 @@ fn notify_steps(paths: &Paths, job: JobId) -> BTreeSet<String> {
             job: job.to_string(),
         },
     ) {
-        Ok(Response::JobDetail { job, .. }) => job
-            .graph
-            .steps
-            .iter()
-            .filter(|(_, step)| matches!(step.action, Action::Notify { .. }))
-            .map(|(id, _)| id.clone())
-            .collect(),
+        Ok(Response::JobDetail { job, .. }) => job.notify_steps(),
         _ => BTreeSet::new(),
     }
 }
@@ -1411,6 +1570,7 @@ fn submit_file(
     at: Option<&str>,
     every: Option<&str>,
     zone: Option<&str>,
+    wait: bool,
 ) -> Result<()> {
     let config = Config::load(&paths.config_file)?;
     let text =
@@ -1446,23 +1606,635 @@ fn submit_file(
     let steps = spec.graph.steps.len();
     let name = spec.name.clone();
 
+    if wait {
+        check_wait_allowed(paths)?;
+    }
     match request(
         paths,
         RequestBody::Submit {
             spec: Box::new(spec),
         },
     )? {
-        Response::Submitted { job, .. } => {
+        Response::Submitted { job, run, .. } => {
             let label = name.map(|name| format!(" {name:?}")).unwrap_or_default();
             println!(
                 "{job}{label} — {steps} step{}, first run {}",
                 if steps == 1 { "" } else { "s" },
                 timeparse::describe_instant(&first, &now.timestamp(), &timeparse::local_zone())
             );
-            Ok(())
+            wait_after_submit(paths, wait, job, run)
         }
         other => fail_on(other),
     }
+}
+
+// ---------------------------------------------------------------------------
+// cued wait — block on a run, exit with its outcome
+// ---------------------------------------------------------------------------
+
+// Exit statuses. 1 stays "cued itself failed" (anyhow's default) and 2 is
+// clap's usage error, so neither can be mistaken for a run's outcome.
+const WAIT_FAILED: i32 = 3;
+const WAIT_HELD: i32 = 4;
+const WAIT_ENDED: i32 = 5;
+/// `--wait` only: the job was submitted, but waiting on it failed. Not 1,
+/// so a wrapper that retries on error doesn't submit the job twice.
+const WAIT_SUBMITTED_UNWATCHED: i32 = 6;
+const WAIT_TIMED_OUT: i32 = 124;
+
+/// How long the daemon may be unreachable mid-wait before we give up. A
+/// restart or `cued upgrade` is seconds; anything longer means nothing is
+/// going to finish the run.
+const WAIT_DAEMON_GRACE: Duration = Duration::from_secs(60);
+/// The same, for the first request: no daemon at all is more likely an
+/// answer than an outage, so say so sooner.
+const WAIT_START_GRACE: Duration = Duration::from_secs(10);
+const WAIT_POLL: Duration = Duration::from_secs(1);
+/// The longest a waiter sleeps while nothing can happen on its own (the
+/// next firing is far off): a cancel or retry still shows up this soon.
+const WAIT_QUIET_CAP: Duration = Duration::from_secs(30);
+/// A daemon that accepts but never answers must not hold a waiter for
+/// long; a status read is never this slow. Clamped to what's left of
+/// `--timeout`.
+const WAIT_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+// A wait is on a `RunQuery`: `Latest` (the run in progress, else the next
+// to fire, else the job's last word), `Exact` (that run, whatever it is), or
+// `After` (the first run created after that id; 0 for the job's first).
+
+fn wait(
+    paths: &Paths,
+    reference: &str,
+    run: Option<i64>,
+    timeout: Option<Duration>,
+    json: bool,
+) -> Result<()> {
+    // clap has already checked that this deadline is representable.
+    let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+    let target = run.map_or(RunQuery::Latest, RunQuery::Exact);
+    let result = wait_on(paths, reference, target, deadline, json);
+    // A script reading `--json` gets an object on every exit, not only on
+    // an outcome or a timeout. (The error goes to stderr as usual too.)
+    if json && let Err(error) = &result {
+        println!(
+            "{}",
+            serde_json::json!({
+                "job": null,
+                "reference": reference,
+                "status": "error",
+                "error": format!("{error:#}"),
+                "exit": 1,
+            })
+        );
+    }
+    finish(result)
+}
+
+/// `--wait` on a submitting command: a one-off reply names its run, so
+/// there's no window for it to finish unobserved; a recurring job waits
+/// for its first.
+fn wait_after_submit(paths: &Paths, wait: bool, job: JobId, run: Option<RunId>) -> Result<()> {
+    if !wait {
+        return Ok(());
+    }
+    let target = match run {
+        Some(run) => RunQuery::Exact(run.0),
+        None => RunQuery::After(0),
+    };
+    match wait_on(paths, &job.to_string(), target, None, false) {
+        Ok(code) => finish(Ok(code)),
+        Err(error) => {
+            eprintln!(
+                "cued: {job} was submitted, but waiting on it failed: {error:#} — \
+                 `cued wait {job}` picks it up again"
+            );
+            finish(Ok(WAIT_SUBMITTED_UNWATCHED))
+        }
+    }
+}
+
+/// `--wait`'s check before submitting: if the daemon would refuse the wait
+/// (MCP `read` off, say), refuse now, before a job exists that nothing is
+/// watching.
+fn check_wait_allowed(paths: &Paths) -> Result<()> {
+    match request(paths, RequestBody::WaitAllowed)? {
+        Response::WaitAllowed => Ok(()),
+        other => fail_on::<()>(other).context("not submitted: its `--wait` would be refused"),
+    }
+}
+
+/// Exit with a wait's status, once what it printed is out.
+fn finish(code: Result<i32>) -> Result<()> {
+    let code = code?;
+    std::io::stdout().flush()?;
+    std::process::exit(code)
+}
+
+/// Poll until the target settles, and report it. `reference` is what was
+/// asked for; after the first reply every poll goes by id instead, since a
+/// name is only unique among live jobs and could be reused once this one
+/// ends. No poll auto-spawns a daemon: one started from here would take
+/// this shell's environment, and with it the MCP policy the daemon
+/// enforces on our behalf.
+fn wait_on(
+    paths: &Paths,
+    reference: &str,
+    mut target: RunQuery,
+    deadline: Option<std::time::Instant>,
+    json: bool,
+) -> Result<i32> {
+    let mut job: Option<JobId> = None;
+    loop {
+        let asked = job.map_or_else(|| reference.to_string(), |job| job.to_string());
+        // The first request is likelier to find no daemon at all than an
+        // outage, so it gives up sooner.
+        let grace = match job {
+            None => WAIT_START_GRACE,
+            Some(_) => WAIT_DAEMON_GRACE,
+        };
+        let Some(reply) = poll_job(paths, &asked, target, grace, deadline, job.is_some())? else {
+            return Ok(timed_out(job, reference, target, json));
+        };
+        let id = reply.job;
+        job = Some(id);
+        let crate::proto::JobRun {
+            status,
+            more,
+            run,
+            last_id,
+            quiet_until,
+            steps,
+            ..
+        } = reply;
+        // A step executing now finishes even on a paused job; nothing else
+        // about a paused job moves until it's resumed.
+        let executing = run
+            .as_ref()
+            .is_some_and(|run| run.status == RunStatus::Running);
+
+        match (target, run) {
+            // A run still going is the one to wait for.
+            (RunQuery::Latest | RunQuery::After(_), Some(run)) if !run.status.is_settled() => {
+                // Hold on to it: the next poll must not slide past it to a
+                // later one if it settles between polls.
+                target = RunQuery::Exact(run.id.0);
+            }
+            // Asked for by id, so whatever it is — a Skipped one included.
+            (RunQuery::Exact(_), Some(run)) => {
+                if run.status.is_settled() {
+                    return Ok(report_run(id, &run, steps, json));
+                }
+            }
+            // Not created yet: worth waiting for while the job can still
+            // fire. At or below the highest id, it existed and is gone.
+            (RunQuery::Exact(want), None) if want > last_id && more => {}
+            (RunQuery::Exact(want), None) if want > last_id => {
+                bail!("there is no run {id}.r{want}, and {id} won't create one")
+            }
+            (RunQuery::Exact(want), None) => bail!("there is no run {id}.r{want}"),
+            (RunQuery::After(_), Some(run)) => return Ok(report_run(id, &run, steps, json)),
+            // The latest run is settled. A Held one blocks the job until
+            // someone acts, so it's the answer now.
+            (RunQuery::Latest, Some(run)) if run.status == RunStatus::Held => {
+                return Ok(report_run(id, &run, steps, json));
+            }
+            (RunQuery::Latest, Some(run)) if more => {
+                target = RunQuery::After(run.id.0);
+                continue;
+            }
+            // Nothing more is coming. A job that ran its course answers
+            // with its last run; one cancelled or expired has ended,
+            // whatever that run did before.
+            (RunQuery::Latest, Some(run)) => {
+                return Ok(match status {
+                    crate::model::JobStatus::Cancelled | crate::model::JobStatus::Expired => {
+                        ended(id, status, Some(&run), json)
+                    }
+                    _ => report_run(id, &run, steps, json),
+                });
+            }
+            (RunQuery::Latest | RunQuery::After(_), None) if !more => {
+                return Ok(ended(id, status, None, json));
+            }
+            (RunQuery::Latest, None) => {
+                target = RunQuery::After(0);
+                continue;
+            }
+            (RunQuery::After(_), None) => {}
+        }
+        // A paused job is refused once the wait needs it to move: a run
+        // between steps or not yet started, or a run not yet created, waits
+        // for `cued resume`, which may never come. A step executing now is
+        // still worth waiting out — it finishes regardless.
+        if status == crate::model::JobStatus::Paused && !executing {
+            bail!(
+                "{id} is paused, so `cued wait` won't wait on it — it starts no \
+                 new work until `cued resume {id}`"
+            );
+        }
+        // Checked on both sides of the pause: a run that settles after the
+        // deadline is a timeout, not an outcome reported late.
+        if past(deadline) {
+            return Ok(timed_out(job, reference, target, json));
+        }
+        poll_pause(deadline, quiet_until);
+        if past(deadline) {
+            return Ok(timed_out(job, reference, target, json));
+        }
+    }
+}
+
+fn past(deadline: Option<std::time::Instant>) -> bool {
+    deadline.is_some_and(|at| std::time::Instant::now() >= at)
+}
+
+/// Sleep one poll interval — longer, up to `WAIT_QUIET_CAP`, while nothing
+/// can happen on its own before `quiet_until` — but never past `deadline`.
+fn poll_pause(deadline: Option<std::time::Instant>, quiet_until: Option<Timestamp>) {
+    let mut nap = WAIT_POLL;
+    if let Some(at) = quiet_until {
+        let ahead = Duration::try_from(at.duration_since(Timestamp::now())).unwrap_or_default();
+        if ahead > 2 * WAIT_POLL {
+            nap = (ahead - WAIT_POLL).min(WAIT_QUIET_CAP);
+        }
+    }
+    if let Some(at) = deadline {
+        nap = nap.min(at.saturating_duration_since(std::time::Instant::now()));
+    }
+    std::thread::sleep(nap);
+}
+
+/// The job is over with no run of its own to report: cancelled or expired
+/// (`last` is what it ran before that, if anything), or out of runs before
+/// the one a waiter was owed.
+fn ended(
+    job: JobId,
+    status: crate::model::JobStatus,
+    last: Option<&crate::proto::RunEntry>,
+    json: bool,
+) -> i32 {
+    let state = status.as_str();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "job": job.to_string(),
+                "run": null,
+                "status": state,
+                "last_run": last.map(|run| serde_json::json!({
+                    "run": run.id.to_string(),
+                    "status": run.status.as_str(),
+                })),
+                "exit": WAIT_ENDED,
+            })
+        );
+    } else {
+        match last {
+            Some(run) => println!(
+                "{job} is {state}; its last run, {job}.{}, was {}",
+                run.id,
+                run.status.as_str()
+            ),
+            None => println!("{job} is {state} with no run left to wait for"),
+        }
+    }
+    WAIT_ENDED
+}
+
+/// `job` is the resolved id when we have one; `reference` is what was
+/// asked for, which is all there is if the daemon never answered. JSON
+/// keeps the two apart so `job` is always an id or null.
+fn timed_out(job: Option<JobId>, reference: &str, target: RunQuery, json: bool) -> i32 {
+    let run = match target {
+        RunQuery::Exact(id) => Some(RunId(id)),
+        _ => None,
+    };
+    let label = job.map_or_else(|| reference.to_string(), |job| job.to_string());
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "job": job.map(|job| job.to_string()),
+                "reference": reference,
+                "run": run.map(|run| run.to_string()),
+                "status": "timeout",
+                "exit": WAIT_TIMED_OUT,
+            })
+        );
+    } else {
+        match run {
+            Some(run) => println!("{label}.{run} still going when --timeout ran out"),
+            None => println!("{label}: no run finished before --timeout ran out"),
+        }
+    }
+    WAIT_TIMED_OUT
+}
+
+/// One `Runs` poll. `None` means `deadline` passed first.
+fn poll_job(
+    paths: &Paths,
+    job: &str,
+    query: RunQuery,
+    grace: Duration,
+    deadline: Option<std::time::Instant>,
+    answered_before: bool,
+) -> Result<Option<crate::proto::JobRun>> {
+    let body = || RequestBody::Runs {
+        job: job.to_string(),
+        run: query,
+    };
+    match wait_request(paths, body, grace, deadline, answered_before)? {
+        None => Ok(None),
+        Some(Response::JobRun(reply)) => Ok(Some(*reply)),
+        Some(other) => fail_on(other),
+    }
+}
+
+/// One request on a waiter's terms: never auto-spawn (a waiter must not
+/// resurrect a daemon stopped on purpose, by `cued uninstall` say), ride
+/// out a connection that fails for up to `grace` (a restart or upgrade),
+/// and give up at `deadline`. Only the transport is retried: a reply the
+/// daemon chose to send — an error, or one we can't decode — is final.
+///
+/// Failures say which they were: no daemon to connect to, or one that took
+/// the connection and didn't answer in time. And if `deadline` passes
+/// before any daemon has ever answered this waiter (`answered_before`) or
+/// accepted a connection, that's no daemon, not a timeout — nothing is
+/// running to finish the run, and exiting 124 would say to try later.
+fn wait_request(
+    paths: &Paths,
+    body: impl Fn() -> RequestBody,
+    grace: Duration,
+    deadline: Option<std::time::Instant>,
+    answered_before: bool,
+) -> Result<Option<Response>> {
+    let started = std::time::Instant::now();
+    // A daemon is there: it took a connection, or has one queued it isn't
+    // accepting. Either way it isn't "no daemon".
+    let mut ever_connected = false;
+    // What went wrong last time we actually got to try.
+    let mut failure = String::from("the deadline passed before the daemon could be reached");
+    loop {
+        // One absolute bound for the whole exchange — connect, every write,
+        // every read — never a timeout handed out again per call.
+        let now = std::time::Instant::now();
+        let until = deadline.map_or(now + WAIT_IO_TIMEOUT, |at| at.min(now + WAIT_IO_TIMEOUT));
+        match exchange_until(&paths.socket_file, body(), until) {
+            Ok(line) => {
+                let reply = advise_on_rejection(decode_reply(&line)?)?;
+                // A status that arrived after `--timeout` is too late to
+                // count. Anything else — an error above all — is an answer
+                // whenever it comes; turning "no such job" into 124 would
+                // say "try later" about something that will never succeed.
+                if past(deadline) && matches!(reply, Response::JobRun(_)) {
+                    return Ok(None);
+                }
+                return Ok(Some(reply));
+            }
+            Err(Exchange::NoDaemon) => failure = "no daemon is running".to_string(),
+            // A spent budget says nothing about the daemon; keep the last
+            // thing that did.
+            Err(Exchange::OutOfTime) => {}
+            Err(Exchange::QueueFull) => {
+                ever_connected = true;
+                failure = "the daemon isn't accepting connections (its queue is full)".to_string();
+            }
+            Err(Exchange::NoReply) => {
+                ever_connected = true;
+                failure = format!(
+                    "the daemon takes connections but doesn't reply \
+                     (each try waited up to {}s)",
+                    WAIT_IO_TIMEOUT.as_secs()
+                );
+            }
+            Err(Exchange::Broken(error)) => {
+                ever_connected = true;
+                failure = format!("the daemon isn't answering ({error:#})");
+            }
+            // Not a daemon's state but ours — retrying won't change it.
+            Err(Exchange::Unusable(error)) => return Err(error),
+        }
+        let out_of_time = past(deadline);
+        // The short first-request grace is for "is there a daemon at all";
+        // one that took a connection is there, and gets the full grace.
+        let grace = if ever_connected {
+            grace.max(WAIT_DAEMON_GRACE)
+        } else {
+            grace
+        };
+        if started.elapsed() >= grace || (out_of_time && !answered_before && !ever_connected) {
+            let advice = if ever_connected {
+                format!("it's running but stuck; see {}", paths.daemon_log.display())
+            } else {
+                "runs can't progress without it, and `cued wait` doesn't start one — \
+                 any other cued command does"
+                    .to_string()
+            };
+            bail!(
+                "{failure}; gave up after {}s — {advice}",
+                started.elapsed().as_secs()
+            );
+        }
+        if out_of_time {
+            return Ok(None);
+        }
+        poll_pause(deadline, None);
+    }
+}
+
+/// `UnixStream::connect`, bounded. A blocking connect to a Unix socket
+/// waits, without limit, whenever the listener's accept queue is full —
+/// exactly the daemon a waiter must be able to give up on. So connect
+/// nonblocking, where a full queue is EAGAIN instead, and retry that until
+/// `limit`; then hand back an ordinary blocking stream.
+fn connect_within(path: &Path, limit: Duration) -> std::io::Result<UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: sockaddr_un is plain old data; all-zero is a valid value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    // Leave room for the terminating NUL.
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socket path too long",
+        ));
+    }
+    for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+
+    // SAFETY: a plain socket(2) call; the result is checked before use.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a socket we just created and nothing else owns.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    let until = std::time::Instant::now() + limit;
+    loop {
+        // SAFETY: `addr` is initialised above and `len` covers its path.
+        let result = unsafe {
+            libc::connect(
+                socket.as_raw_fd(),
+                (&raw const addr).cast::<libc::sockaddr>(),
+                len,
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::EAGAIN) if std::time::Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Some(libc::EAGAIN) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the daemon's connection queue stayed full",
+                ));
+            }
+            _ => return Err(error),
+        }
+    }
+    let stream = UnixStream::from(socket);
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+/// How one waiter exchange failed, for the message and the grace.
+enum Exchange {
+    /// Nothing to connect to: no socket, or no one listening on it.
+    NoDaemon,
+    /// The bound had passed before anything was tried.
+    OutOfTime,
+    /// A daemon is listening but its accept queue stayed full.
+    QueueFull,
+    /// Connected, but the reply didn't arrive in time.
+    NoReply,
+    /// Connected, and the exchange broke some other way.
+    Broken(anyhow::Error),
+    /// The socket can't be used at all — permissions, a path too long, out
+    /// of descriptors. Not "no daemon", and not something waiting fixes.
+    Unusable(anyhow::Error),
+}
+
+/// One request and its reply line, all within `until`: the connect, each
+/// write and each read get only what's left of that one bound, so neither
+/// a slow accept nor a reply trickling in piece by piece can stretch it.
+fn exchange_until(
+    path: &Path,
+    body: RequestBody,
+    until: std::time::Instant,
+) -> std::result::Result<String, Exchange> {
+    let limit = time_left(until).map_err(|_| Exchange::OutOfTime)?;
+    let stream = match connect_within(path, limit) {
+        Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            return Err(Exchange::QueueFull);
+        }
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT | libc::ECONNREFUSED)
+            ) =>
+        {
+            return Err(Exchange::NoDaemon);
+        }
+        Err(error) => {
+            return Err(Exchange::Unusable(
+                anyhow::Error::from(error).context(format!("connecting to {}", path.display())),
+            ));
+        }
+    };
+    let failed = |error: std::io::Error, doing: &'static str| match error.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Exchange::NoReply,
+        _ => Exchange::Broken(anyhow::Error::from(error).context(doing)),
+    };
+    write_request(&stream, body, Some(until))
+        .map_err(|error| failed(error, "writing to daemon"))?;
+    read_reply_line(&stream, Some(until)).map_err(|error| failed(error, "reading daemon reply"))
+}
+
+/// The outcome, and — when MCP `logs` lets the daemon send them — each
+/// step's exit code. Never captured output or env.
+fn report_run(
+    job: JobId,
+    run: &crate::proto::RunEntry,
+    steps: Option<crate::proto::RunSteps>,
+    json: bool,
+) -> i32 {
+    let code = match run.status {
+        RunStatus::Done => 0,
+        RunStatus::Failed => WAIT_FAILED,
+        RunStatus::Held => WAIT_HELD,
+        _ => WAIT_ENDED,
+    };
+    let state = run.status.as_str();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "job": job.to_string(),
+                "run": run.id.to_string(),
+                "status": state,
+                "fail_reason": run.fail_reason,
+                "ended_at": run.ended_at,
+                // `notify` marks a notification step: its attempt has no
+                // exit code because it ran no process, not because it died.
+                "attempts": steps.as_ref().map(|steps| {
+                    steps
+                        .attempts
+                        .iter()
+                        .map(|attempt| {
+                            let mut value = serde_json::to_value(attempt)
+                                .unwrap_or(serde_json::Value::Null);
+                            value["notify"] = steps.notify.contains(&attempt.step).into();
+                            value
+                        })
+                        .collect::<Vec<_>>()
+                }),
+                "exit": code,
+            })
+        );
+        return code;
+    }
+
+    let reason = run
+        .fail_reason
+        .as_deref()
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    println!("{job}.{} {state}{reason}", run.id);
+    if let Some(steps) = &steps {
+        for entry in &steps.attempts {
+            println!(
+                "  {}",
+                attempt_header(entry, steps.notify.contains(&entry.step))
+            );
+        }
+    }
+    match run.status {
+        RunStatus::Held => println!(
+            "held for review — `cued continue {job}` resumes it, `cued retry {job}` reruns it"
+        ),
+        RunStatus::Failed => println!("output: cued logs {job} --run {}", run.id.0),
+        _ => {}
+    }
+    code
 }
 
 // ---------------------------------------------------------------------------
@@ -2013,7 +2785,13 @@ fn human_size(bytes: u64) -> String {
 /// The `then` / `then_after` vectors clap parsed are deliberately ignored —
 /// they've lost the order between them, which for a pipeline is most of the
 /// meaning — and the links are recovered from the raw argv instead.
-fn chain(paths: &Paths, first: &str, on_fail: &str, common: SubmitCommon) -> Result<()> {
+fn chain(
+    paths: &Paths,
+    first: &str,
+    on_fail: &str,
+    common: SubmitCommon,
+    wait: bool,
+) -> Result<()> {
     let config = Config::load(&paths.config_file)?;
     let now = Zoned::now();
 
@@ -2045,13 +2823,16 @@ fn chain(paths: &Paths, first: &str, on_fail: &str, common: SubmitCommon) -> Res
         hooks: Hooks::default(),
     };
 
+    if wait {
+        check_wait_allowed(paths)?;
+    }
     match request(
         paths,
         RequestBody::Submit {
             spec: Box::new(spec),
         },
     )? {
-        Response::Submitted { job, .. } => {
+        Response::Submitted { job, run, .. } => {
             println!(
                 "{job} — {steps} step{} chained, starting now ({})",
                 if steps == 1 { "" } else { "s" },
@@ -2060,7 +2841,7 @@ fn chain(paths: &Paths, first: &str, on_fail: &str, common: SubmitCommon) -> Res
                     submit::ChainFailure::Continue => "continues past failures",
                 }
             );
-            Ok(())
+            wait_after_submit(paths, wait, job, run)
         }
         other => fail_on(other),
     }

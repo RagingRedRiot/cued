@@ -1,4 +1,9 @@
-//! Stdio-only MCP front end. Capability policy belongs here, never in the daemon.
+//! Stdio-only MCP front end. Capability policy lives here: this server
+//! evaluates it for its own calls, and nothing else decides it. The one
+//! exception is `wait_policy`, which the daemon calls to answer `cued wait`
+//! — the shell command an MCP-restricted model may still be allowed — under
+//! the same `read`/`logs` switches, tighten-only and from its own
+//! environment, so `wait` can't reopen what this server closes.
 //! Protocol: https://modelcontextprotocol.io/specification/2025-06-18
 use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
@@ -53,29 +58,30 @@ impl Default for McpConfig {
 }
 impl McpConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let mut config = match std::fs::read_to_string(path) {
-            Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-        };
-        for key in ["exec", "notify", "read", "logs"] {
-            let name = format!("CUED_MCP_{}", key.to_uppercase());
-            if let Ok(value) = std::env::var(&name) {
-                let parsed = Value::String(value);
-                match key {
-                    "exec" => config.exec = serde_json::from_value(parsed).with_context(|| name)?,
-                    "notify" => {
-                        config.notify = serde_json::from_value(parsed).with_context(|| name)?
-                    }
-                    "read" => config.read = serde_json::from_value(parsed).with_context(|| name)?,
-                    "logs" => config.logs = serde_json::from_value(parsed).with_context(|| name)?,
-                    _ => unreachable!(),
-                }
-            }
+        let mut config = Self::load_file(path)?;
+        if let Some(exec) = env_override("exec")? {
+            config.exec = exec;
+        }
+        if let Some(notify) = env_override("notify")? {
+            config.notify = notify;
+        }
+        if let Some(read) = env_override("read")? {
+            config.read = read;
+        }
+        if let Some(logs) = env_override("logs")? {
+            config.logs = logs;
         }
         Ok(config)
+    }
+    /// The file alone, without the `CUED_MCP_*` overrides.
+    fn load_file(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
     }
     fn action(&self, key: &str, path: &Path) -> Result<bool> {
         let capability = match key {
@@ -697,13 +703,131 @@ pub fn serve(input: impl BufRead, mut output: impl Write, server: &Server) -> Re
     Ok(())
 }
 
+fn default_config_path(paths: &Paths) -> PathBuf {
+    paths.config_file.with_file_name("mcp.toml")
+}
+
+/// `CUED_MCP_<KEY>`, parsed as that key's setting, if set.
+fn env_override<T: serde::de::DeserializeOwned>(key: &str) -> Result<Option<T>> {
+    let name = format!("CUED_MCP_{}", key.to_uppercase());
+    match std::env::var(&name) {
+        Ok(value) => Ok(Some(
+            serde_json::from_value(Value::String(value)).with_context(|| name)?,
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+/// What the daemon may tell `cued wait`, under the MCP policy: refuses
+/// outright unless `read` is on (job status is what `read` governs), then
+/// says whether `logs` is on too (per-step results are what `logs`
+/// governs). `cued wait` is the one shell command a model restricted to
+/// MCP is expected to be allowed, so it must not reopen what MCP closes.
+///
+/// Called by the daemon, against its own environment: the waiter's shell is
+/// where an override could be planted, so nothing it sets counts. And the
+/// settings only ever tighten — off in the default `mcp.toml`, in a
+/// `CUED_MCP_CONFIG` file, or in `CUED_MCP_READ`/`CUED_MCP_LOGS` wins, and
+/// nothing turns a switch back on. An unreadable or invalid policy refuses,
+/// as it fails an MCP call closed. Re-read per request, as MCP re-reads per
+/// call.
+pub fn wait_policy(paths: &Paths) -> Result<WaitPolicy> {
+    let mut files = vec![default_config_path(paths)];
+    if let Some(path) = std::env::var_os("CUED_MCP_CONFIG").map(PathBuf::from) {
+        // A file named on purpose must exist. Read as "no file, defaults",
+        // a typo or a relative path resolved from the daemon's directory
+        // would quietly open what the file was meant to close.
+        ensure!(
+            path.is_file(),
+            "the daemon's CUED_MCP_CONFIG names {}, which isn't a file{} — \
+             refusing `cued wait` rather than guessing its policy",
+            path.display(),
+            if path.is_relative() {
+                " (relative paths resolve from the daemon's working directory)"
+            } else {
+                ""
+            }
+        );
+        if !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    let mut logs = true;
+    for path in &files {
+        let config = McpConfig::load_file(path)?;
+        ensure!(
+            config.read == Switch::On,
+            "`read = \"off\"` in {} withholds job status, so the daemon won't answer \
+             `cued wait` — set `read` to `on` there to allow waiting",
+            path.display()
+        );
+        logs &= config.logs == Switch::On;
+    }
+    ensure!(
+        env_override::<Switch>("read")? != Some(Switch::Off),
+        "the daemon runs with CUED_MCP_READ=off, which withholds job status from `cued wait`"
+    );
+    logs &= env_override::<Switch>("logs")? != Some(Switch::Off);
+    Ok(WaitPolicy { steps: logs })
+}
+
+/// What `wait_policy` allows beyond job status.
+#[derive(Debug, Clone, Copy)]
+pub struct WaitPolicy {
+    /// Per-step results (MCP `logs`).
+    pub steps: bool,
+}
+
+/// `cued wait` is answered by the daemon under the policy in the default
+/// `mcp.toml` and the daemon's own environment — not this server's launch
+/// environment, which it can't see. If this server is stricter on `read` or
+/// `logs` only through that environment, `wait` would show what this server
+/// withholds, so say so where the client logs a server's stderr.
+fn warn_if_wait_is_looser(paths: &Paths, config_path: &Path, policy: &McpConfig) {
+    let default_path = default_config_path(paths);
+    // Only a warning: a default file this server doesn't use must never
+    // stop it starting. If it's broken, `cued wait` is refused anyway.
+    let Ok(shared) = McpConfig::load_file(&default_path) else {
+        return;
+    };
+    for (key, here, there) in [
+        ("read", policy.read, shared.read),
+        ("logs", policy.logs, shared.logs),
+    ] {
+        if here != Switch::Off || there != Switch::On {
+            continue;
+        }
+        // `policy` merges file and environment, so ask each layer: an
+        // override in the environment wins, else the file named by
+        // CUED_MCP_CONFIG is what turned it off.
+        let source = if matches!(env_override::<Switch>(key), Ok(Some(Switch::Off))) {
+            format!(
+                "CUED_MCP_{}=off in this server's environment",
+                key.to_uppercase()
+            )
+        } else {
+            format!(
+                "`{key} = \"off\"` in {} (CUED_MCP_CONFIG)",
+                config_path.display()
+            )
+        };
+        eprintln!(
+            "cued mcp: warning: {key} off here comes from {source}, which `cued wait` \
+             doesn't see — the daemon answers it under {}. Set {key} off there too to \
+             cover `cued wait`.",
+            default_path.display()
+        );
+    }
+}
+
 pub fn run() -> Result<()> {
     let paths = Paths::resolve()?;
     let config_path = std::env::var_os("CUED_MCP_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|| paths.config_file.with_file_name("mcp.toml"));
+        .unwrap_or_else(|| default_config_path(&paths));
     // Refuse to start on a bad policy; afterwards each call re-reads it.
-    McpConfig::load(&config_path)?;
+    let policy = McpConfig::load(&config_path)?;
+    warn_if_wait_is_looser(&paths, &config_path, &policy);
     let server = Server::from_file(paths, config_path);
     serve(std::io::stdin().lock(), std::io::stdout().lock(), &server)
 }

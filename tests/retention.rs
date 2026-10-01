@@ -359,3 +359,49 @@ async fn held_and_live_runs_are_never_collected() -> Result<()> {
     );
     Ok(())
 }
+
+/// `cued wait --run N` tells "not created yet" from "gone" by the job's
+/// highest run id. That must come from the id high-water mark, not the
+/// rows left: age-based GC can prune every run a quiet job has, and a
+/// pruned run must not look like one still to come.
+#[tokio::test]
+async fn pruned_runs_still_count_as_created() -> Result<()> {
+    use cued::proto::RunQuery;
+    let h = harness().await?;
+    let now = Timestamp::now();
+    let anchor = now.checked_sub(SignedDuration::from_hours(24 * 90))?;
+    let (job, _, _) = h
+        .store
+        .submit_job(&spec("quiet", recurring(&anchor)), &anchor)
+        .await?;
+    let old = now.checked_sub(SignedDuration::from_hours(24 * 60))?;
+    for index in 1..=3 {
+        sqlx::query(
+            "INSERT INTO runs (job_id, id, scheduled_for, status, cursor_kind, cursor_step, cursor_at)
+             VALUES (?, ?, ?, 'pending', 'waiting', 'run', ?)",
+        )
+        .bind(job.0)
+        .bind(index)
+        .bind(old.to_string())
+        .bind(old.to_string())
+        .execute(h.store.pool())
+        .await?;
+        finish_run(&h, job, RunId(index), &old).await?;
+    }
+    collect_garbage(
+        &h.store,
+        &h.paths,
+        &Retention {
+            days: 30,
+            runs_per_job: 100,
+        },
+        &now,
+    )
+    .await?;
+    assert!(run_ids(&h.store, job).await.is_empty(), "all pruned");
+
+    let (reply, _) = h.store.job_run(job, RunQuery::Exact(2)).await?;
+    assert!(reply.run.is_none());
+    assert_eq!(reply.last_id, 3, "r2 was created; it's gone, not pending");
+    Ok(())
+}

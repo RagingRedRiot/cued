@@ -92,6 +92,29 @@ impl JobStatus {
     pub fn is_live(self) -> bool {
         matches!(self, Self::Active | Self::Paused)
     }
+
+    /// Read back what `as_str` wrote. Keep the two in step.
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "active" => Self::Active,
+            "paused" => Self::Paused,
+            "done" => Self::Done,
+            "cancelled" => Self::Cancelled,
+            "expired" => Self::Expired,
+            _ => return None,
+        })
+    }
+
+    /// The stored and displayed spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Done => "done",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,10 +188,21 @@ impl Job {
     pub fn display_status(&self) -> String {
         display_status(self.status, self.approval.as_ref())
     }
+
+    /// Steps whose action is a notification: they spawn no process, so an
+    /// attempt with no exit code means "notified", not "killed" (§2.2).
+    pub fn notify_steps(&self) -> std::collections::BTreeSet<StepId> {
+        self.graph
+            .steps
+            .iter()
+            .filter(|(_, step)| matches!(step.action, Action::Notify { .. }))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
 }
 
 pub fn display_status(status: JobStatus, approval: Option<&Approval>) -> String {
-    let lifecycle = format!("{status:?}").to_lowercase();
+    let lifecycle = status.as_str().to_string();
     match approval.map(|a| a.state) {
         Some(ApprovalState::Pending) if status.is_live() => {
             format!("Pending approval ({lifecycle})")
@@ -535,6 +569,45 @@ pub enum RunStatus {
     /// range (§4.2, §5.3).
     Skipped,
     Cancelled,
+}
+
+impl RunStatus {
+    /// Final as far as a waiter is concerned: Done, Failed and the rest
+    /// are over, and Held parks until a human (or agent) acts.
+    pub fn is_settled(self) -> bool {
+        !matches!(self, Self::Pending | Self::Running | Self::Waiting)
+    }
+
+    /// Read back what `as_str` wrote. Keep the two in step.
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "pending" => Self::Pending,
+            "running" => Self::Running,
+            "waiting" => Self::Waiting,
+            "held" => Self::Held,
+            "done" => Self::Done,
+            "failed" => Self::Failed,
+            "missed" => Self::Missed,
+            "skipped" => Self::Skipped,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
+
+    /// The stored and displayed spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Held => "held",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Missed => "missed",
+            Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// PERSISTED runtime position — flattened into columns on `runs` so

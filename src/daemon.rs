@@ -36,7 +36,7 @@ use crate::model::{
 use crate::model::{CatchUp, Overlap};
 use crate::notify::{Delivery, DesktopNotifier, Notifier};
 use crate::paths::Paths;
-use crate::proto::{JobEntry, PROTO_VERSION, Request, RequestBody, Response, RunEntry};
+use crate::proto::{JobEntry, PROTO_VERSION, Request, RequestBody, Response, RunEntry, RunSteps};
 use crate::store::{Claim, DueStep, Fired, Firing, GcOutcome, NextCursor, StepClose, Store};
 use crate::{schedule, submit};
 
@@ -2622,6 +2622,18 @@ async fn dispatch(ctx: &Ctx, line: &str) -> Response {
                 message: format!("{error:#}"),
             },
         },
+        RequestBody::WaitAllowed => match crate::mcp::wait_policy(&ctx.paths) {
+            Ok(_) => Response::WaitAllowed,
+            Err(error) => Response::Error {
+                message: format!("{error:#}"),
+            },
+        },
+        RequestBody::Runs { job, run } => match handle_runs(ctx, &job, run).await {
+            Ok(reply) => Response::JobRun(Box::new(reply)),
+            Err(error) => Response::Error {
+                message: format!("{error:#}"),
+            },
+        },
     }
 }
 
@@ -2674,6 +2686,52 @@ async fn handle_logs(
     let job = ctx.store.resolve_job(reference).await?;
     let (run, attempts) = ctx.store.log_manifest(job, run, step, attempt).await?;
     Ok((job, run, attempts))
+}
+
+/// `cued wait`'s poll, gated here rather than in the client: the daemon's
+/// environment was fixed when it started, while the waiter's is whatever
+/// shell asked. Reads only — never the writer. A lapsed approval is the
+/// scheduler's to expire (it sweeps at least every `MAX_TICK`).
+async fn handle_runs(
+    ctx: &Ctx,
+    reference: &str,
+    query: crate::proto::RunQuery,
+) -> Result<crate::proto::JobRun> {
+    let policy = crate::mcp::wait_policy(&ctx.paths)?;
+    let job = ctx.store.resolve_job(reference).await?;
+    let (mut reply, pending) = ctx.store.job_run(job, query).await?;
+    // Step results go only with a run the waiter is about to report, and
+    // only while `logs` allows them.
+    let wants_steps = |reply: &crate::proto::JobRun| {
+        policy.steps
+            && reply
+                .run
+                .as_ref()
+                .is_some_and(|run| run.status.is_settled())
+    };
+    if !pending && !wants_steps(&reply) {
+        return Ok(reply);
+    }
+    let definition = ctx.store.load_job(job).await?;
+    if pending {
+        // Nothing happens on its own before the approval deadline: let the
+        // waiter nap toward it, rather than poll a job that may sit pending
+        // for days. Approving is a command, noticed within a nap.
+        reply.quiet_until = Some(definition.approval_deadline()?.0);
+    }
+    if wants_steps(&reply)
+        && let Some(run) = &reply.run
+    {
+        let (_, attempts) = ctx
+            .store
+            .log_manifest(job, Some(run.id.0), None, None)
+            .await?;
+        reply.steps = Some(RunSteps {
+            attempts,
+            notify: definition.notify_steps(),
+        });
+    }
+    Ok(reply)
 }
 
 /// §4.2 cancel: stop re-arming, mark every live run `Cancelled`, and reach
