@@ -8,14 +8,39 @@ Early alpha: commands, storage, and protocols may change without compatibility
 support. Interrupted commands can require human review; cued does not guarantee
 exactly-once external effects.
 
-## Install
+## Install and upgrade
 
-Build and install with Rust and Cargo from this checkout:
+Installing and upgrading are the same steps: put the new binary in place, then
+run `cued setup` the first time or `cued upgrade` after that.
+
+### Release download
+
+A single static binary for x86_64 Linux, checked against its published
+checksum:
 
 ```sh
-cargo install --path . --locked
-cued setup
+base=https://github.com/RagingRedRiot/cued/releases/latest/download
+curl -fLO "$base/cued-x86_64-linux.tar.gz" -O "$base/cued-x86_64-linux.tar.gz.sha256"
+sha256sum -c cued-x86_64-linux.tar.gz.sha256
+tar -xzf cued-x86_64-linux.tar.gz cued
+install -D -m 755 cued ~/.local/bin/cued
+cued setup      # first install; `cued upgrade` when updating
 ```
+
+While the repository is private, those URLs need GitHub access; fetch the same
+files with `gh release download --repo RagingRedRiot/cued --pattern 'cued-*'`.
+Any directory on your `PATH` works in place of `~/.local/bin`.
+
+### Cargo
+
+If you have Rust, build and install from source:
+
+```sh
+cargo install --git https://github.com/RagingRedRiot/cued --locked
+cued setup      # first install; `cued upgrade` when updating
+```
+
+### Setup
 
 `setup` offers the persistence backends available on your machine: a systemd user
 service, systemd with linger, or cron `@reboot`. Linger can require administrator
@@ -24,14 +49,11 @@ Without setup, the first client starts the daemon on demand.
 Use `cued setup --status` to inspect the installation and
 `cued setup --uninstall` to remove it.
 
-## Upgrade
+### Upgrade
 
-Install the new build over the old one, then move the running daemon onto it:
-
-```sh
-cargo install --path . --locked
-cued upgrade
-```
+`install` and `cargo install` both replace the file rather than write into it,
+so the running daemon is untouched until `cued upgrade`. Plain `cp` can't
+write over a running binary and fails with "Text file busy".
 
 The daemon stops starting new steps, lets running ones finish, and re-executes
 the installed binary in place. Its PID, socket, persistence backend, and store
@@ -44,15 +66,15 @@ reconcile per `on_interrupt` as after any restart.
 
 ```sh
 cued uninstall          # add --purge to remove ~/.config/cued too
-cargo uninstall cued
+rm ~/.local/bin/cued    # or `cargo uninstall cued` if Cargo installed it
 ```
 
 `uninstall` lists what it will delete and asks first: it removes the
 persistence backend, stops the daemon (terminating any running steps), and
 deletes the store, all job history, logs, and the socket. Your config files are
-kept unless you pass `--purge`. The binary belongs to Cargo, so remove it with
-`cargo uninstall`. Off a terminal, `--yes` is required. To keep a job, export it
-first with `cued show ID --toml`.
+kept unless you pass `--purge`. The binary is yours to remove, as above. Off
+a terminal, `--yes` is required. To keep a job, export it first with
+`cued show ID --toml`.
 
 ## Use
 

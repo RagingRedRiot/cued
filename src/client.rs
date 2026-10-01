@@ -2374,7 +2374,8 @@ const STOP_PROGRESS_EVERY: Duration = Duration::from_secs(15);
 /// `setup --uninstall`, then everything else cued put on this account:
 /// stop the daemon, delete the store, logs and socket. Config is the
 /// user's own writing, so it goes only with `--purge`; the binary belongs
-/// to whatever installed it (cargo), so it is pointed at, never deleted.
+/// to whatever installed it (cargo, or the user from a release download),
+/// so it is pointed at, never deleted.
 fn uninstall(paths: &Paths, purge: bool, yes: bool) -> Result<()> {
     let installed = installed_backends();
     // Deliberately no auto-spawn: starting a daemon to delete it would
@@ -2426,7 +2427,8 @@ fn uninstall(paths: &Paths, purge: bool, yes: bool) -> Result<()> {
     }
     if let Ok(exe) = persist::daemon_exe() {
         println!(
-            "  - the binary, {} (remove with `cargo uninstall cued`)",
+            "  - the binary, {} (remove with `cargo uninstall cued`, or delete it \
+             if you installed a release download)",
             exe.display()
         );
     }
@@ -2503,7 +2505,8 @@ cued is uninstalled."
     );
     if let Ok(exe) = persist::daemon_exe() {
         println!(
-            "The binary remains at {}; `cargo uninstall cued` removes it.",
+            "The binary remains at {}; remove it with `cargo uninstall cued`, or delete it \
+             if you installed a release download.",
             exe.display()
         );
     }
