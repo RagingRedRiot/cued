@@ -8,25 +8,28 @@ use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Serialize;
 
 use anyhow::{Context, Result, bail, ensure};
-use jiff::{Timestamp, Zoned};
+use jiff::{SignedDuration, Timestamp, Zoned};
 
 use crate::cli::{Command, SubmitCommon};
 use crate::config::Config;
 use crate::model::{
-    Action, Condition, Effect, Hooks, Job, JobId, JobSpec, OutputMatch, Policies, RunId, Schedule,
-    Step, Wait,
+    Action, Condition, Effect, Hooks, Job, JobId, JobSpec, OutputMatch, Policies, RunId, RunStatus,
+    Schedule, Step, Wait,
 };
 use crate::paths::Paths;
 use crate::persist::{
     self, Availability, BackendStatus, CronReboot, PersistenceBackend, SystemdUser,
 };
-use crate::proto::{JobEntry, LogAttempt, PROTO_VERSION, Request, RequestBody, Response};
+use crate::proto::{
+    JobEntry, LogAttempt, MAX_UPGRADE_WAIT_SECS, PROTO_VERSION, Request, RequestBody, Response,
+};
 use crate::{submit, timeparse};
 
 pub fn run(command: Command) -> Result<()> {
@@ -94,6 +97,8 @@ pub fn run(command: Command) -> Result<()> {
             status,
             uninstall,
         } => setup(backend, status, uninstall),
+        Command::Upgrade { wait, force } => upgrade(&paths, &wait, force),
+        Command::Uninstall { purge, yes } => uninstall(&paths, purge, yes),
     }
 }
 
@@ -500,18 +505,36 @@ fn rearm(paths: &Paths, body: RequestBody, verb: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn request(paths: &Paths, body: RequestBody) -> Result<Response> {
-    let stream = connect_or_spawn(paths)?;
+    exchange(&connect_or_spawn(paths)?, body)
+}
+
+/// One request, one reply, on a connection the caller chose.
+fn exchange(stream: &UnixStream, body: RequestBody) -> Result<Response> {
+    let response = exchange_raw(stream, body)?;
+    if let Response::Error { message } = &response
+        && message.starts_with("bad request:")
+    {
+        bail!(
+            "{message} — run `cued upgrade`, or stop the running `cued daemon` and rerun if it predates that command"
+        );
+    }
+    Ok(response)
+}
+
+/// `exchange` without translating a rejected request into advice, for the
+/// callers that know better what a rejection means.
+fn exchange_raw(stream: &UnixStream, body: RequestBody) -> Result<Response> {
     let mut payload = serde_json::to_string(&Request {
         proto: PROTO_VERSION,
         body,
     })?;
     payload.push('\n');
-    (&stream)
+    (&*stream)
         .write_all(payload.as_bytes())
         .context("writing to daemon")?;
 
     let mut line = String::new();
-    BufReader::new(&stream)
+    BufReader::new(stream)
         .read_line(&mut line)
         .context("reading daemon reply")?;
     ensure!(
@@ -526,11 +549,6 @@ pub(crate) fn request(paths: &Paths, body: RequestBody) -> Result<Response> {
     let response: Response = serde_json::from_str(&line).context(
         "couldn't decode the daemon's reply — it is probably running an older          build than this CLI; stop the running `cued daemon` and rerun, and the          next command respawns it",
     )?;
-    if let Response::Error { message } = &response
-        && message.starts_with("bad request:")
-    {
-        bail!("{message} — stop the running `cued daemon` and rerun; the next command respawns it");
-    }
     Ok(response)
 }
 
@@ -578,14 +596,14 @@ fn connect_or_spawn(paths: &Paths) -> Result<UnixStream> {
 }
 
 /// Terminal handling for every reply that isn't the one the caller wanted.
-fn fail_on(response: Response) -> Result<()> {
+fn fail_on<T>(response: Response) -> Result<T> {
     match response {
         Response::Error { message } => bail!("{message}"),
         // §5.1: upgrading the binary under a live old daemon is the
         // expected failure mode — designed message, not a serde error.
         Response::ProtoMismatch { daemon_proto } => bail!(
             "daemon (proto {daemon_proto}) doesn't match this CLI (proto {PROTO_VERSION}) — \
-             kill the running `cued daemon` and rerun; the next command respawns it"
+             run `cued upgrade`, or stop the running `cued daemon` and rerun if it predates that command"
         ),
         other => bail!("unexpected daemon reply: {other:?}"),
     }
@@ -747,16 +765,28 @@ fn setup_install(backend: &dyn PersistenceBackend) -> Result<()> {
     Ok(())
 }
 
+/// What is installed, once each. `systemd-linger` and `systemd` are two
+/// offers of the same unit file — linger is an account setting, not part of
+/// the install — so both report it, and removing it is the same either way.
+fn installed_backends() -> Vec<Box<dyn PersistenceBackend>> {
+    BACKEND_KEYS
+        .iter()
+        .zip(backends())
+        .filter(|(key, backend)| {
+            **key != "systemd-linger" && matches!(backend.status(), Ok(BackendStatus::Installed))
+        })
+        .map(|(_, backend)| backend)
+        .collect()
+}
+
 fn setup_uninstall() -> Result<()> {
     let mut removed = false;
-    for backend in backends() {
-        if matches!(backend.status(), Ok(BackendStatus::Installed)) {
-            println!("Removing {}", backend.name());
-            for note in backend.uninstall()? {
-                println!("  {note}");
-            }
-            removed = true;
+    for backend in installed_backends() {
+        println!("Removing {}", backend.name());
+        for note in backend.uninstall()? {
+            println!("  {note}");
         }
+        removed = true;
     }
     if removed {
         println!("\nNo persistence backend is installed; the daemon is ad-hoc again (§5.2).");
@@ -1456,6 +1486,522 @@ fn gc(paths: &Paths) -> Result<()> {
             Ok(())
         }
         other => fail_on(other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cued upgrade (§5.2)
+// ---------------------------------------------------------------------------
+
+/// Move the running daemon onto the binary now installed at its path: the
+/// daemon finishes its running steps, then re-executes in place. The store,
+/// the persistence backend and the daemon's PID are all left as they were.
+fn upgrade(paths: &Paths, wait: &str, force: bool) -> Result<()> {
+    let wait = timeparse::parse_duration(wait)?;
+    ensure!(wait.is_positive(), "--wait must be positive");
+    let wait_secs = wait.as_secs().max(1) as u64;
+    ensure!(
+        wait_secs <= MAX_UPGRADE_WAIT_SECS,
+        "--wait can be at most {}",
+        timeparse::describe_duration(SignedDuration::from_secs(MAX_UPGRADE_WAIT_SECS as i64))
+    );
+
+    // Deliberately no auto-spawn: a fresh daemon would already be the
+    // installed binary, so there is nothing to do.
+    let Ok(stream) = UnixStream::connect(&paths.socket_file) else {
+        println!("no daemon is running — the next cued command starts the installed binary");
+        return Ok(());
+    };
+    eprintln!(
+        "cued: waiting up to {} for running steps to finish…",
+        timeparse::describe_duration(wait)
+    );
+    match exchange_raw(&stream, RequestBody::Upgrade { wait_secs, force })? {
+        // Only a daemon built before `upgrade` existed fails to decode it.
+        Response::Error { message } if message.starts_with("bad request:") => bail!(
+            "the running daemon predates `cued upgrade`, so it can't be upgraded in place. \
+             Restart it once — `systemctl --user restart cued` if you use the systemd \
+             backend, otherwise stop the `cued daemon` process and run any cued command — \
+             and later upgrades will work"
+        ),
+        Response::UpgradeCurrent { exe } => {
+            println!(
+                "daemon is already running the binary installed at {}",
+                exe.display()
+            );
+            Ok(())
+        }
+        Response::UpgradeAbandoned { reason } => bail!("upgrade abandoned: {reason}"),
+        Response::Upgrading { exe } => {
+            let pid = await_new_image(paths)?;
+            // Answering is not enough: a daemon that could not exec the new
+            // build falls back to its old image, which answers too.
+            if !runs_binary(pid, &exe) {
+                bail!(
+                    "the daemon could not start {} and is still running the previous build \
+                     — see {}",
+                    exe.display(),
+                    paths.daemon_log.display()
+                );
+            }
+            println!("daemon upgraded in place to {}", exe.display());
+            // The daemon execs its own path, which is what the persistence
+            // backend starts too. If this CLI lives elsewhere, the two are
+            // now different builds — worth saying.
+            let ours = std::env::current_exe().and_then(|exe| exe.canonicalize());
+            if ours.as_ref().is_ok_and(|ours| *ours != exe) {
+                eprintln!(
+                    "cued: note: this CLI is {}, not the daemon's binary",
+                    ours.expect("checked").display()
+                );
+            }
+            Ok(())
+        }
+        other => fail_on(other),
+    }
+}
+
+/// The socket never closed across the exec, so this connects at once and
+/// the reply arrives when the new image has reconciled and is serving.
+/// Returns the pid that answered.
+fn await_new_image(paths: &Paths) -> Result<i32> {
+    let stream = UnixStream::connect(&paths.socket_file).with_context(|| {
+        format!(
+            "the daemon did not come back — see {}",
+            paths.daemon_log.display()
+        )
+    })?;
+    // Startup runs migrations, which on a large store can take a while.
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    match exchange(&stream, RequestBody::Ping) {
+        Ok(Response::Pong { .. }) => {
+            peer_pid(&stream).context("couldn't identify the process serving the daemon socket")
+        }
+        Ok(other) => fail_on(other),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "the upgraded daemon is not answering — see {}",
+                paths.daemon_log.display()
+            )
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cued uninstall (§8.2)
+// ---------------------------------------------------------------------------
+
+/// How long the daemon locks may stay held with no daemon process to wait
+/// for (one that exited between our look and its last unlock, or a holder
+/// we cannot identify) before uninstall stops waiting.
+const UNIDENTIFIED_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// How often uninstall says it is still waiting for the daemon to stop.
+const STOP_PROGRESS_EVERY: Duration = Duration::from_secs(15);
+
+/// `setup --uninstall`, then everything else cued put on this account:
+/// stop the daemon, delete the store, logs and socket. Config is the
+/// user's own writing, so it goes only with `--purge`; the binary belongs
+/// to whatever installed it (cargo), so it is pointed at, never deleted.
+fn uninstall(paths: &Paths, purge: bool, yes: bool) -> Result<()> {
+    let installed = installed_backends();
+    // Deliberately no auto-spawn: starting a daemon to delete it would
+    // create the very store we are about to remove.
+    let daemon = UnixStream::connect(&paths.socket_file).ok();
+    let daemon_pid = daemon.as_ref().and_then(peer_pid);
+    let summary = daemon.as_ref().and_then(|stream| {
+        match exchange(stream, RequestBody::List { all: true }) {
+            Ok(Response::JobList { jobs }) => Some(describe_store(&jobs)),
+            _ => None,
+        }
+    });
+    drop(daemon);
+    let config_dir = paths.config_file.parent().map(Path::to_path_buf);
+
+    println!("This removes cued from this account:");
+    for backend in &installed {
+        println!("  - persistence: {}", backend.name());
+    }
+    match (daemon_pid, &summary) {
+        (Some(pid), Some(summary)) if summary.running > 0 => println!(
+            "  - the daemon (pid {pid}), terminating {} running step{}",
+            summary.running,
+            if summary.running == 1 { "" } else { "s" }
+        ),
+        (Some(pid), _) => println!("  - the daemon (pid {pid})"),
+        (None, _) => {}
+    }
+    let size = dir_size(&paths.data_dir);
+    match &summary {
+        Some(summary) => println!(
+            "  - {} ({}): {}",
+            paths.data_dir.display(),
+            human_size(size),
+            summary.describe()
+        ),
+        None => println!(
+            "  - {} ({}): the job store, all history and logs",
+            paths.data_dir.display(),
+            human_size(size)
+        ),
+    }
+    if purge && let Some(dir) = config_dir.as_ref().filter(|dir| dir.exists()) {
+        println!("  - {} (your config)", dir.display());
+    }
+    println!("Kept:");
+    if !purge && let Some(dir) = config_dir.as_ref().filter(|dir| dir.exists()) {
+        println!("  - {} (your config; --purge removes it)", dir.display());
+    }
+    if let Ok(exe) = persist::daemon_exe() {
+        println!(
+            "  - the binary, {} (remove with `cargo uninstall cued`)",
+            exe.display()
+        );
+    }
+    if summary.as_ref().is_some_and(|summary| summary.live > 0) {
+        println!(
+            "
+To keep a job, export it first: cued show ID --toml > job.toml"
+        );
+    }
+
+    if !yes {
+        ensure!(
+            stdin_is_a_tty(),
+            "not a terminal — rerun with --yes to confirm deleting the above"
+        );
+        print!(
+            "
+Delete all of this? It cannot be undone. [y/N] "
+        );
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("reading your answer")?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("Nothing removed.");
+            return Ok(());
+        }
+    }
+
+    // Backend first: systemd stops a supervised daemon itself, and nothing
+    // can start a new one at boot once both backends are gone.
+    for backend in &installed {
+        println!("Removing {}", backend.name());
+        for note in backend.uninstall()? {
+            println!("  {note}");
+        }
+    }
+
+    // Identified afresh rather than from the pid shown above: that daemon
+    // may have exited since (systemd stops a supervised one itself, and the
+    // prompt can sit for a long time), and its pid been reused.
+    let daemon = ServingDaemon::find(paths);
+    if let Some(daemon) = &daemon {
+        daemon.terminate();
+    }
+    // Holding both locks proves no daemon is left, and keeps one a stray
+    // client auto-spawns meanwhile from opening the store under us.
+    let locks = hold_daemon_locks(paths, daemon.as_ref())?;
+
+    let mut removed = Vec::new();
+    for path in [paths.socket_file.clone(), paths.socket_lock()] {
+        if remove_file_if_present(&path)? {
+            removed.push(path);
+        }
+    }
+    if remove_owned_dir(&paths.data_dir)? {
+        removed.push(paths.data_dir.clone());
+    }
+    drop(locks);
+    if purge
+        && let Some(dir) = &config_dir
+        && remove_owned_dir(dir)?
+    {
+        removed.push(dir.clone());
+    }
+    for path in &removed {
+        println!("removed {}", path.display());
+    }
+
+    println!(
+        "
+cued is uninstalled."
+    );
+    if let Ok(exe) = persist::daemon_exe() {
+        println!(
+            "The binary remains at {}; `cargo uninstall cued` removes it.",
+            exe.display()
+        );
+    }
+    println!(
+        "Running any cued command — including an MCP client launching `cued mcp` — \
+         starts afresh with an empty store."
+    );
+    Ok(())
+}
+
+/// What the store holds, for the confirmation.
+struct StoreSummary {
+    jobs: usize,
+    live: usize,
+    held: usize,
+    running: usize,
+}
+
+impl StoreSummary {
+    fn describe(&self) -> String {
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let mut text = format!("{} job{}", self.jobs, plural(self.jobs));
+        if self.live > 0 {
+            text.push_str(&format!(", {} still scheduled", self.live));
+        }
+        if self.held > 0 {
+            text.push_str(&format!(
+                ", {} held run{} awaiting review",
+                self.held,
+                plural(self.held)
+            ));
+        }
+        text + ", all history and logs"
+    }
+}
+
+fn describe_store(jobs: &[JobEntry]) -> StoreSummary {
+    let last = |status: RunStatus| {
+        jobs.iter()
+            .filter(|job| {
+                job.last_run
+                    .as_ref()
+                    .is_some_and(|run| run.status == status)
+            })
+            .count()
+    };
+    StoreSummary {
+        jobs: jobs.len(),
+        live: jobs.iter().filter(|job| job.status.is_live()).count(),
+        held: last(RunStatus::Held),
+        running: last(RunStatus::Running),
+    }
+}
+
+/// Whether `pid` is executing the file now at `exe` — compared by inode,
+/// since a replaced binary keeps running under its old path.
+fn runs_binary(pid: i32, exe: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        std::fs::metadata(format!("/proc/{pid}/exe")),
+        std::fs::metadata(exe),
+    ) {
+        (Ok(running), Ok(installed)) => {
+            (running.dev(), running.ino()) == (installed.dev(), installed.ino())
+        }
+        _ => false,
+    }
+}
+
+/// Who is on the other end of the daemon socket, from the kernel rather
+/// than anything the daemon says (the same peer credentials §7.3 uses).
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: ucred is plain data; getsockopt writes at most `len` bytes.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let status = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &mut len,
+        )
+    };
+    // SAFETY: getuid is a read-only query of the current process identity.
+    let ours = cred.uid == unsafe { libc::getuid() };
+    (status == 0 && ours && cred.pid > 0).then_some(cred.pid)
+}
+
+/// Wait for the daemon to let go of both its locks, then hold them. For as
+/// long as the daemon is alive this waits: its shutdown takes as long as
+/// its slowest step's `kill_grace`, which is the user's to set, and giving
+/// up would leave the account half-uninstalled.
+fn hold_daemon_locks(
+    paths: &Paths,
+    daemon: Option<&ServingDaemon>,
+) -> Result<(std::fs::File, std::fs::File)> {
+    let started = std::time::Instant::now();
+    let mut gone_since = None;
+    let mut next_progress = started + STOP_PROGRESS_EVERY;
+    loop {
+        if let Some(lock) = crate::paths::try_lock(&paths.lock_file)?
+            && let Some(socket_lock) = crate::paths::try_lock(&paths.socket_lock())?
+        {
+            return Ok((lock, socket_lock));
+        }
+        let now = std::time::Instant::now();
+        if daemon.is_some_and(ServingDaemon::is_alive) {
+            if now >= next_progress {
+                eprintln!(
+                    "cued: waiting for the daemon to finish terminating its running steps \
+                     ({}s so far; Ctrl-C to stop waiting and rerun `cued uninstall` later)",
+                    (now - started).as_secs()
+                );
+                next_progress = now + STOP_PROGRESS_EVERY;
+            }
+        } else {
+            let since = *gone_since.get_or_insert(now);
+            ensure!(
+                now - since < UNIDENTIFIED_LOCK_WAIT,
+                "something still holds the daemon's locks ({} or {}) — stop any running \
+                 `cued daemon` and rerun `cued uninstall`; the persistence backend is \
+                 already removed",
+                paths.lock_file.display(),
+                paths.socket_lock().display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The process serving the daemon socket right now, held by pidfd where
+/// the kernel offers one (Linux 6.5+), so that signalling it can never reach
+/// a different process that has since been given the same pid.
+enum ServingDaemon {
+    Pidfd(std::os::fd::OwnedFd),
+    /// Older kernels: a pid read just now from a live connection.
+    Pid(i32),
+}
+
+impl ServingDaemon {
+    fn find(paths: &Paths) -> Option<Self> {
+        let stream = UnixStream::connect(&paths.socket_file).ok()?;
+        match peer_pidfd(&stream) {
+            Some(pidfd) => Some(Self::Pidfd(pidfd)),
+            None => peer_pid(&stream).map(Self::Pid),
+        }
+    }
+
+    fn terminate(&self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: signalling the process the daemon socket's peer
+        // credentials named; one already exiting makes either a no-op.
+        unsafe {
+            match self {
+                Self::Pidfd(pidfd) => {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        pidfd.as_raw_fd(),
+                        libc::SIGTERM,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+                Self::Pid(pid) => {
+                    libc::kill(*pid, libc::SIGTERM);
+                }
+            }
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        match self {
+            // A pidfd turns readable once its process has exited.
+            Self::Pidfd(pidfd) => {
+                let mut poll = libc::pollfd {
+                    fd: pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd, no wait.
+                unsafe { libc::poll(&mut poll, 1, 0) == 0 }
+            }
+            // SAFETY: signal 0 only checks existence.
+            Self::Pid(pid) => unsafe { libc::kill(*pid, 0) == 0 },
+        }
+    }
+}
+
+/// `SO_PEERPIDFD`: a pidfd for the socket's peer, straight from the kernel.
+/// `None` on kernels without it, or for a peer that is not ours.
+fn peer_pidfd(stream: &UnixStream) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    peer_pid(stream)?; // same-uid check
+    let mut fd: libc::c_int = -1;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into `fd`.
+    let status = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&raw mut fd).cast(),
+            &mut len,
+        )
+    };
+    // SAFETY: on success the kernel handed us a new descriptor to own.
+    (status == 0 && fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+fn remove_file_if_present(path: &Path) -> Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// Recursive delete, but only of a directory that is plainly ours: named
+/// `cued`, and a real directory. An XDG variable pointing somewhere odd can
+/// at worst make this refuse, never widen what it removes. A symlink is
+/// removed as a link; whatever it points at is left alone.
+fn remove_owned_dir(dir: &Path) -> Result<bool> {
+    ensure!(
+        dir.file_name().is_some_and(|name| name == "cued"),
+        "refusing to delete {}: not a cued directory",
+        dir.display()
+    );
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("checking {}", dir.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        std::fs::remove_file(dir)
+    } else {
+        std::fs::remove_dir_all(dir)
+    }
+    .with_context(|| format!("removing {}", dir.display()))?;
+    Ok(true)
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => dir_size(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
     }
 }
 

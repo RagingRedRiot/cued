@@ -159,6 +159,32 @@ pub enum Command {
         uninstall: bool,
     },
 
+    /// Remove cued from this account: the persistence backend, the running
+    /// daemon, and the store with all job history and logs (§8.2). Your
+    /// config files and the binary itself are kept
+    Uninstall {
+        /// Also remove the config directory (config.toml, mcp.toml).
+        #[arg(long)]
+        purge: bool,
+        /// Don't ask for confirmation (required when not on a terminal).
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Switch the running daemon to the installed binary without touching
+    /// its persistence or store: running steps finish first, then the
+    /// daemon re-executes in place (§5.2)
+    Upgrade {
+        /// How long to let running steps finish (§9 duration).
+        #[arg(long, default_value = "10m")]
+        wait: String,
+        /// If steps are still running after --wait, interrupt them (they
+        /// reconcile per `on_interrupt`, as after any restart) rather than
+        /// abandon the upgrade.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Run the daemon (what persistence backends invoke; auto-spawned by
     /// the client when absent, §5.2)
     Daemon(DaemonArgs),
@@ -185,6 +211,10 @@ pub struct DaemonArgs {
     /// Log to stderr instead of quietly to the journal/log file.
     #[arg(long)]
     pub foreground: bool,
+    /// Internal: the instance lock, socket lock and listener fds an
+    /// upgrading daemon hands to its re-executed self (§5.2).
+    #[arg(long, hide = true, value_name = "LOCK,SOCKET_LOCK,LISTENER")]
+    pub handoff: Option<String>,
 }
 
 #[cfg(test)]

@@ -100,15 +100,59 @@ async fn run_async(args: DaemonArgs) -> Result<()> {
     }
     eprintln!("cued: daemon starting (pid {})", std::process::id());
 
+    // The path an upgrade re-executes: the one we were started from, which
+    // is also what the persistence backend names. Resolved now, while it
+    // still names this image — once a new build is renamed over it,
+    // /proc/self/exe reads "… (deleted)".
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|exe| {
+            // A fallback after a failed upgrade exec is started through
+            // /proc/self/exe, whose path then reads "… (deleted)". The path
+            // without the suffix is still where the install lives, which is
+            // what the next upgrade should look at.
+            use std::os::unix::ffi::OsStrExt;
+            match exe.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+                Some(path) => std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path)),
+                None => exe,
+            }
+        })
+        .and_then(|exe| exe.canonicalize().ok());
+
     // §5.2: the authoritative single-instance guard. Held for the daemon's
     // lifetime; a second daemon (leftover cron @reboot vs systemd) fails
-    // here, before it can touch the store.
-    let _lock = acquire_instance_lock(&paths)?;
-    let _socket_lock = acquire_socket_lock(&paths)?;
+    // here, before it can touch the store. An upgraded daemon never let go
+    // of either lock, so it adopts them rather than racing for them again.
+    let (lock, socket_lock, listener) = match args.handoff.as_deref() {
+        Some(fds) => {
+            let (lock, socket_lock, listener) = adopt_handoff(&paths, fds)?;
+            eprintln!("cued: resumed after upgrade from inherited locks and socket");
+            (lock, socket_lock, Some(listener))
+        }
+        None => (
+            acquire_instance_lock(&paths)?,
+            acquire_socket_lock(&paths)?,
+            None,
+        ),
+    };
 
     let config = Config::load(&paths.config_file)?;
     let store = Store::open(&paths.db_file).await?;
-    serve(paths, config, store).await
+    let reexec = Reexec {
+        exe,
+        foreground: args.foreground,
+        lock,
+        socket_lock,
+    };
+    serve_inner(
+        paths,
+        config,
+        store,
+        DesktopNotifier::default(),
+        listener,
+        Some(reexec),
+    )
+    .await
 }
 
 /// Everything after the lock + store open: reconcile, bind, tick — with the
@@ -126,6 +170,18 @@ pub async fn serve_with<N: Notifier + 'static>(
     store: Store,
     notifier: N,
 ) -> Result<()> {
+    // In-process: there is no binary of ours to re-execute, so no upgrades.
+    serve_inner(paths, config, store, notifier, None, None).await
+}
+
+async fn serve_inner<N: Notifier + 'static>(
+    paths: Paths,
+    config: Config,
+    store: Store,
+    notifier: N,
+    inherited: Option<std::os::unix::net::UnixListener>,
+    reexec: Option<Reexec>,
+) -> Result<()> {
     let (arm, arm_rx) = mpsc::unbounded_channel();
 
     // §3.4: resolve every non-terminal run before serving anyone — held
@@ -136,8 +192,28 @@ pub async fn serve_with<N: Notifier + 'static>(
         let _ = arm.send(due);
     }
 
-    let listener = bind_socket(&paths)?;
+    // An inherited listener was never closed, so clients that connected
+    // while we re-executed are already queued on it.
+    let listener = match inherited {
+        Some(listener) => {
+            listener
+                .set_nonblocking(true)
+                .context("adopting the socket")?;
+            UnixListener::from_std(listener).context("adopting the socket")?
+        }
+        None => bind_socket(&paths)?,
+    };
+    // A second descriptor for the same socket, so it outlives the accept
+    // task when an upgrade stops that task, and can cross the exec.
+    let listener_fd = {
+        use std::os::fd::AsFd;
+        listener
+            .as_fd()
+            .try_clone_to_owned()
+            .context("duplicating the listening socket")?
+    };
     let (nudge, nudge_rx) = mpsc::unbounded_channel();
+    let (upgrade_tx, mut upgrade_rx) = mpsc::unbounded_channel();
     let ctx = Arc::new(Ctx {
         store,
         paths,
@@ -148,25 +224,460 @@ pub async fn serve_with<N: Notifier + 'static>(
         nudge,
         live: Registry::default(),
         stopping: Arc::default(),
+        work: Arc::new(()),
+        draining: Arc::default(),
+        wake: Arc::default(),
+        upgrades: reexec.is_some().then_some(upgrade_tx),
+        upgrading: Arc::default(),
+        reply_written: Arc::default(),
     });
 
     // §3.5: the delivery task's immediate first pass drains any backlog —
     // including on_hold notifications reconciliation just enqueued.
-    tokio::spawn(delivery_loop(ctx.store.clone(), notifier, nudge_rx));
-    tokio::spawn(accept_loop(Arc::clone(&ctx), listener));
-    tokio::spawn(gc_loop(Arc::clone(&ctx)));
+    let delivery = tokio::spawn(delivery_loop(ctx.store.clone(), notifier, nudge_rx));
+    let accept = tokio::spawn(accept_loop(Arc::clone(&ctx), listener));
+    let gc = tokio::spawn(gc_loop(Arc::clone(&ctx)));
+    let mut tasks = Some(DaemonTasks {
+        delivery,
+        accept,
+        gc,
+    });
 
-    // §2.2 names four things that terminate a step the same way: a timeout,
-    // `cued cancel`, a `deadline`, and a clean daemon shutdown. The first
-    // three went through the §2.3 registry; this is the fourth.
-    tokio::select! {
-        result = scheduler(Arc::clone(&ctx), arm_rx) => result,
-        signal = shutdown_signal() => {
-            eprintln!("cued: {signal} — shutting down");
-            terminate_live_steps(&ctx).await;
-            Ok(())
+    let scheduler = scheduler(Arc::clone(&ctx), arm_rx);
+    tokio::pin!(scheduler);
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    // The upgrade in progress, and when its drain gives up.
+    let mut pending: Option<(UpgradeOrder, tokio::time::Instant)> = None;
+
+    loop {
+        // §2.2 names four things that terminate a step the same way: a
+        // timeout, `cued cancel`, a `deadline`, and a clean daemon
+        // shutdown. The first three went through the §2.3 registry; this
+        // is the fourth.
+        tokio::select! {
+            result = &mut scheduler => return result,
+            signal = &mut shutdown => {
+                eprintln!("cued: {signal} — shutting down");
+                if let Some((order, _)) = pending.take() {
+                    let _ = order.reply.send(Response::UpgradeAbandoned {
+                        reason: format!("the daemon received {signal} and is shutting down"),
+                    });
+                }
+                terminate_live_steps(&ctx).await;
+                return Ok(());
+            }
+            Some(order) = upgrade_rx.recv(), if pending.is_none() => {
+                let reexec = reexec.as_ref().expect("upgrades are only sent with a reexec");
+                // Runs the candidate binary, so keep the scheduler polled
+                // meanwhile (see the forced-interrupt note below).
+                let preflight = tokio::select! {
+                    result = &mut scheduler => return result,
+                    preflight = upgrade_preflight(reexec) => preflight,
+                };
+                match preflight {
+                    Err(reply) => {
+                        ctx.upgrading.store(false, SeqCst);
+                        let _ = order.reply.send(reply);
+                    }
+                    Ok(()) => {
+                        eprintln!(
+                            "cued: upgrade requested — draining (up to {:?}{})",
+                            order.wait,
+                            if order.force { ", then interrupting" } else { "" },
+                        );
+                        // Stop starting work; what is running finishes.
+                        ctx.draining.store(true, SeqCst);
+                        let deadline = tokio::time::Instant::now() + order.wait;
+                        pending = Some((order, deadline));
+                    }
+                }
+            }
+            _ = tokio::time::sleep(DRAIN_POLL), if pending.is_some() => {
+                let deadline = pending.as_ref().expect("guarded").1;
+                if !is_idle(&ctx) && tokio::time::Instant::now() < deadline {
+                    continue;
+                }
+                let (order, _) = pending.take().expect("guarded");
+                if !is_idle(&ctx) {
+                    let running = describe_live(&ctx);
+                    if !order.force {
+                        eprintln!("cued: upgrade abandoned — still running: {running}");
+                        ctx.draining.store(false, SeqCst);
+                        ctx.upgrading.store(false, SeqCst);
+                        ctx.wake.notify_one();
+                        let _ = order.reply.send(Response::UpgradeAbandoned {
+                            reason: format!(
+                                "still running after {}: {running}. Nothing was changed. Retry \
+                                 with a longer --wait, or --force to interrupt them (they then \
+                                 reconcile per on_interrupt, as after any restart)",
+                                crate::timeparse::describe_duration(
+                                    SignedDuration::try_from(order.wait).unwrap_or_default()
+                                ),
+                            ),
+                        });
+                        continue;
+                    }
+                    eprintln!("cued: upgrade forced — interrupting: {running}");
+                    // Keep the scheduler polled throughout: it can be
+                    // parked mid-transaction on the single writer, and
+                    // the tasks being waited for may need that writer.
+                    let interrupt = async {
+                        terminate_live_steps(&ctx).await;
+                        wait_idle(&ctx, SHUTDOWN_MARGIN).await;
+                    };
+                    tokio::select! {
+                        result = &mut scheduler => return result,
+                        // A stop asked for mid-upgrade wins: finish the
+                        // teardown already under way and exit, not exec.
+                        signal = &mut shutdown => {
+                            eprintln!("cued: {signal} during upgrade — shutting down instead");
+                            let _ = order.reply.send(Response::UpgradeAbandoned {
+                                reason: format!("the daemon received {signal} and is shutting down"),
+                            });
+                            terminate_live_steps(&ctx).await;
+                            return Ok(());
+                        }
+                        () = interrupt => {}
+                    }
+                }
+                let reexec = reexec.as_ref().expect("an upgrade was accepted");
+                let tasks = tasks.take().expect("one upgrade reaches exec");
+                let handoff = hand_over(&ctx, reexec, tasks, order, &listener_fd);
+                tokio::select! {
+                    result = &mut scheduler => return result,
+                    // Dropping the handoff drops the order, so the requester
+                    // hears the upgrade did not finish.
+                    signal = &mut shutdown => {
+                        eprintln!("cued: {signal} during upgrade — shutting down instead");
+                        terminate_live_steps(&ctx).await;
+                        return Ok(());
+                    }
+                    error = handoff => {
+                        // Locks, socket and store are already given up;
+                        // the only way back to a working daemon is a new
+                        // image of some kind.
+                        reexec_failed(reexec, &listener_fd, error);
+                    }
+                }
+            }
         }
     }
+}
+
+/// How often a drain checks whether the running work has finished.
+const DRAIN_POLL: Duration = Duration::from_millis(50);
+
+/// How long the last stage of an upgrade waits for each of: request
+/// handlers in flight, the requester's reply, the store's close.
+const HANDOFF_STEP: Duration = Duration::from_secs(5);
+
+use std::sync::atomic::Ordering::SeqCst;
+
+/// What an upgrade needs from startup: what to re-execute, and the two
+/// locks the new image must inherit rather than race for.
+struct Reexec {
+    exe: Option<std::path::PathBuf>,
+    foreground: bool,
+    lock: File,
+    socket_lock: File,
+}
+
+struct DaemonTasks {
+    delivery: tokio::task::JoinHandle<()>,
+    accept: tokio::task::JoinHandle<()>,
+    gc: tokio::task::JoinHandle<()>,
+}
+
+/// One `cued upgrade`, from the request handler to the main loop.
+struct UpgradeOrder {
+    wait: Duration,
+    force: bool,
+    reply: tokio::sync::oneshot::Sender<Response>,
+}
+
+/// Before draining anything: is there a different, runnable binary to
+/// become? Draining a busy daemon only to find nothing to exec would be
+/// a pointless pause.
+async fn upgrade_preflight(reexec: &Reexec) -> std::result::Result<(), Response> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(exe) = &reexec.exe else {
+        return Err(Response::UpgradeAbandoned {
+            reason: "this daemon could not resolve the path it was started from; \
+                     restart it once (`systemctl --user restart cued`, or stop it and \
+                     run any cued command) and upgrades will work from then on"
+                .into(),
+        });
+    };
+    let installed = match std::fs::metadata(exe) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(Response::UpgradeAbandoned {
+                reason: format!("nothing to upgrade to at {}: {error}", exe.display()),
+            });
+        }
+    };
+    if !installed.is_file() || installed.permissions().mode() & 0o111 == 0 {
+        return Err(Response::UpgradeAbandoned {
+            reason: format!("{} is not an executable file", exe.display()),
+        });
+    }
+    // The magic link resolves to the image actually running, even after
+    // its path was renamed over.
+    if let Ok(running) = std::fs::metadata("/proc/self/exe")
+        && (running.dev(), running.ino()) == (installed.dev(), installed.ino())
+    {
+        return Err(Response::UpgradeCurrent { exe: exe.clone() });
+    }
+    // Wrong architecture, missing libraries, a half-written file: find out
+    // now, while backing off costs nothing, rather than at the exec.
+    let probe = tokio::process::Command::new(exe)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output();
+    let failure = match tokio::time::timeout(PREFLIGHT_TIMEOUT, probe).await {
+        Ok(Ok(output)) if output.status.success() => return Ok(()),
+        Ok(Ok(output)) => format!(
+            "{} ({})",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => format!("no answer within {PREFLIGHT_TIMEOUT:?}"),
+    };
+    Err(Response::UpgradeAbandoned {
+        reason: format!(
+            "{} does not run: `--version` failed: {failure}",
+            exe.display()
+        ),
+    })
+}
+
+/// How long the candidate binary gets to answer `--version`.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Spawn work an upgrade's drain must wait for. Every task that claims,
+/// runs or closes steps, or otherwise writes the store, goes through here:
+/// `is_idle` can only see what holds a `work` token, so a bare
+/// `tokio::spawn` of such work would let an upgrade exec in the middle of
+/// it.
+fn spawn_tracked<F>(ctx: &Ctx, work: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let token = WorkToken::new(ctx);
+    tokio::spawn(async move {
+        let _token = token;
+        work.await
+    });
+}
+
+/// Proof of in-flight work, held for as long as the work runs (see
+/// `spawn_tracked`, and `is_idle`, which counts these).
+struct WorkToken {
+    _held: Arc<()>,
+}
+
+impl WorkToken {
+    fn new(ctx: &Ctx) -> Self {
+        Self {
+            _held: Arc::clone(&ctx.work),
+        }
+    }
+}
+
+/// Nothing the scheduler started is still in flight — no step task, no
+/// firing, no request handler — and no process group is held.
+fn is_idle(ctx: &Ctx) -> bool {
+    Arc::strong_count(&ctx.work) == 1 && ctx.live.lock().expect("registry").is_empty()
+}
+
+async fn wait_idle(ctx: &Ctx, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    while !is_idle(ctx) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+    true
+}
+
+/// "j4.r2 attempt 1, j9.r7 attempt 3" — what an upgrade is waiting on.
+fn describe_live(ctx: &Ctx) -> String {
+    let mut attempts: Vec<String> = ctx
+        .live
+        .lock()
+        .expect("registry")
+        .keys()
+        .map(|(job, run, attempt)| format!("{job}.r{} attempt {attempt}", run.0))
+        .collect();
+    attempts.sort();
+    if attempts.is_empty() {
+        // Between steps: a claim, a close, or a request handler.
+        "internal work (no step processes)".into()
+    } else {
+        attempts.join(", ")
+    }
+}
+
+/// The drained daemon's last act: stop accepting (the socket stays open,
+/// so new clients queue for the next image), answer the requester, release
+/// the store, and exec. Returns only if the exec failed.
+async fn hand_over(
+    ctx: &Ctx,
+    reexec: &Reexec,
+    tasks: DaemonTasks,
+    order: UpgradeOrder,
+    listener: &std::os::fd::OwnedFd,
+) -> std::io::Error {
+    tasks.accept.abort();
+    let _ = tasks.accept.await;
+    // A request accepted just before may still be mid-dispatch.
+    if !wait_idle(ctx, HANDOFF_STEP).await {
+        eprintln!("cued: request handlers still busy; re-executing anyway");
+    }
+    let exe = reexec.exe.clone().expect("preflight checked");
+    eprintln!("cued: drained — re-executing {}", exe.display());
+    let notified = ctx.reply_written.notified();
+    let _ = order.reply.send(Response::Upgrading { exe: exe.clone() });
+    let _ = tokio::time::timeout(HANDOFF_STEP, notified).await;
+
+    tasks.delivery.abort();
+    tasks.gc.abort();
+    let _ = tasks.delivery.await;
+    let _ = tasks.gc.await;
+    // A clean close checkpoints the WAL. Bounded: the scheduler may hold
+    // the writer mid-sweep, and SQLite's own journal makes abandoning that
+    // transaction at exec safe anyway.
+    let _ = tokio::time::timeout(HANDOFF_STEP, ctx.store.close()).await;
+
+    exec_daemon(&exe, reexec, listener)
+}
+
+/// Become `exe`, handing it the locks and socket. Only returns on failure.
+fn exec_daemon(
+    exe: &std::path::Path,
+    reexec: &Reexec,
+    listener: &std::os::fd::OwnedFd,
+) -> std::io::Error {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let fds = [
+        reexec.lock.as_raw_fd(),
+        reexec.socket_lock.as_raw_fd(),
+        listener.as_raw_fd(),
+    ];
+    for fd in fds {
+        if let Err(error) = set_cloexec(fd, false) {
+            return error;
+        }
+    }
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("daemon")
+        .arg("--handoff")
+        .arg(format!("{},{},{}", fds[0], fds[1], fds[2]));
+    if reexec.foreground {
+        command.arg("--foreground");
+    }
+    let error = command.exec();
+    // Still us: put the descriptors back out of reach of future children.
+    for fd in fds {
+        let _ = set_cloexec(fd, true);
+    }
+    error
+}
+
+/// The new binary would not exec. The old image is still on disk as
+/// /proc/self/exe whatever happened to its path, so become that instead;
+/// failing even that, exit and let the supervisor (or the next client)
+/// start a daemon.
+fn reexec_failed(reexec: &Reexec, listener: &std::os::fd::OwnedFd, error: std::io::Error) -> ! {
+    eprintln!("cued: upgrade exec failed ({error}); restarting the running version");
+    let error = exec_daemon(std::path::Path::new("/proc/self/exe"), reexec, listener);
+    eprintln!("cued: could not restart either ({error}); exiting");
+    std::process::exit(1)
+}
+
+fn set_cloexec(fd: i32, on: bool) -> std::io::Result<()> {
+    // SAFETY: F_GETFD/F_SETFD on a descriptor this process owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let flags = if on {
+            flags | libc::FD_CLOEXEC
+        } else {
+            flags & !libc::FD_CLOEXEC
+        };
+        if libc::fcntl(fd, libc::F_SETFD, flags) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// The new image's side of `exec_daemon`: take ownership of the inherited
+/// descriptors, after checking they really are this deployment's lock
+/// files and socket — `--handoff` is a CLI flag, and a wrong fd adopted as
+/// a lock would let two daemons share a store.
+fn adopt_handoff(
+    paths: &Paths,
+    fds: &str,
+) -> Result<(File, File, std::os::unix::net::UnixListener)> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let fds: Vec<i32> = fds
+        .split(',')
+        .map(str::parse)
+        .collect::<std::result::Result<_, _>>()
+        .context("--handoff takes three file descriptors")?;
+    let [lock, socket_lock, listener] = fds[..] else {
+        anyhow::bail!("--handoff takes three file descriptors");
+    };
+    for fd in [lock, socket_lock, listener] {
+        ensure!(fd > 2, "--handoff fd {fd} is a standard stream");
+        // Before anything else: no job's child may inherit these.
+        set_cloexec(fd, true).with_context(|| format!("--handoff fd {fd} is not open"))?;
+    }
+
+    let adopt_lock = |fd: i32, path: &std::path::Path| -> Result<File> {
+        // SAFETY: fd was checked open above, and is ours from here on.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let held = file.metadata()?;
+        let named =
+            std::fs::metadata(path).with_context(|| format!("checking {}", path.display()))?;
+        ensure!(
+            (held.dev(), held.ino()) == (named.dev(), named.ino()),
+            "--handoff fd {fd} is not {}",
+            path.display()
+        );
+        // Re-locking through the same open file description we inherited
+        // succeeds; any other holder would make this fail.
+        file.try_lock()
+            .with_context(|| format!("re-asserting the lock on {}", path.display()))?;
+        Ok(file)
+    };
+    let lock = adopt_lock(lock, &paths.lock_file)?;
+    let socket_lock = adopt_lock(socket_lock, &paths.socket_lock())?;
+
+    // SAFETY: as above.
+    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(listener) };
+    let bound = listener
+        .local_addr()
+        .context("inspecting the inherited socket")?;
+    ensure!(
+        bound.as_pathname() == Some(paths.socket_file.as_path()),
+        "the inherited socket is not {}",
+        paths.socket_file.display()
+    );
+    Ok((lock, socket_lock, listener))
 }
 
 /// Resolve on SIGTERM (what a service manager sends) or SIGINT (what a
@@ -410,6 +921,7 @@ fn redirect_stderr_to_log(log_file: &std::path::Path) -> Result<()> {
 /// scheduling because it couldn't tidy up would be a great deal worse.
 async fn gc_loop(ctx: Arc<Ctx>) {
     loop {
+        let work = WorkToken::new(&ctx);
         let swept = collect_garbage(
             &ctx.store,
             &ctx.paths,
@@ -417,6 +929,7 @@ async fn gc_loop(ctx: Arc<Ctx>) {
             &ctx.clock.now(),
         )
         .await;
+        drop(work);
         match swept {
             Ok(outcome) if !outcome.runs.is_empty() || !outcome.jobs.is_empty() => {
                 eprintln!(
@@ -471,11 +984,8 @@ fn remove_dir_if_present(dir: &std::path::Path) {
 /// Try to take the exclusive flock; a held lock means another daemon is
 /// alive, which is a clean, expected exit — not an error to retry.
 fn acquire_instance_lock(paths: &Paths) -> Result<File> {
-    let file = File::create(&paths.lock_file)
-        .with_context(|| format!("creating lock file {}", paths.lock_file.display()))?;
-    file.try_lock()
-        .with_context(|| format!("another cued daemon holds {}", paths.lock_file.display()))?;
-    Ok(file)
+    crate::paths::try_lock(&paths.lock_file)?
+        .with_context(|| format!("another cued daemon holds {}", paths.lock_file.display()))
 }
 
 /// The data-directory flock alone doesn't own the socket: the socket's
@@ -486,16 +996,12 @@ fn acquire_instance_lock(paths: &Paths) -> Result<File> {
 /// the first daemon running its jobs unreachable. Locking a file beside the
 /// socket makes "we hold the lock" true of the socket too.
 fn acquire_socket_lock(paths: &Paths) -> Result<File> {
-    let path = paths.socket_file.with_extension("sock.lock");
-    let file =
-        File::create(&path).with_context(|| format!("creating lock file {}", path.display()))?;
-    file.try_lock().with_context(|| {
+    crate::paths::try_lock(&paths.socket_lock())?.with_context(|| {
         format!(
             "another cued daemon is serving {} (possibly for a different data directory)",
             paths.socket_file.display()
         )
-    })?;
-    Ok(file)
+    })
 }
 
 /// §5.2: we hold both flocks, so any existing socket file is stale by
@@ -611,6 +1117,22 @@ struct Ctx {
     /// Set once a shutdown begins, so a step killed *by* the shutdown is not
     /// then written up as a step that failed (§3.4).
     stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// One clone per in-flight piece of work an upgrade must not cut short:
+    /// each step or firing task the scheduler spawns, each request being
+    /// dispatched, each GC pass. Idle when only this one remains.
+    work: Arc<()>,
+    /// An upgrade is draining: the scheduler keeps its heap but pops nothing.
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes the scheduler when a drain is called off.
+    wake: Arc<tokio::sync::Notify>,
+    /// To the main loop; `None` when there is no binary to re-execute
+    /// (an in-process daemon).
+    upgrades: Option<mpsc::UnboundedSender<UpgradeOrder>>,
+    /// One upgrade at a time.
+    upgrading: Arc<std::sync::atomic::AtomicBool>,
+    /// The `Upgrading` reply reached the requester's socket, so the exec
+    /// that follows can't cut it off.
+    reply_written: Arc<tokio::sync::Notify>,
 }
 
 // ---------------------------------------------------------------------------
@@ -692,40 +1214,42 @@ async fn scheduler(ctx: Arc<Ctx>, mut arm: mpsc::UnboundedReceiver<Arm>) -> Resu
             eprintln!("cued: approval expiry sweep failed: {error:#}");
         }
         let now = wall;
-        while heap.peek().is_some_and(|Reverse(entry)| entry.at <= now) {
+        // An upgrade is draining: due entries stay on the heap. Nothing is
+        // lost if the exec goes ahead — the store has every one of them,
+        // and the next image's `reconcile` rebuilds the heap from it.
+        let draining = ctx.draining.load(SeqCst);
+        while !draining && heap.peek().is_some_and(|Reverse(entry)| entry.at <= now) {
             let Reverse(entry) = heap.pop().expect("peeked");
             match entry.arm {
-                Arm::Step(due) => {
-                    tokio::spawn(run_step(Arc::clone(&ctx), due, 0));
-                }
+                Arm::Step(due) => spawn_tracked(&ctx, run_step(Arc::clone(&ctx), due, 0)),
                 Arm::RetryStep { due, retry, .. } => {
-                    tokio::spawn(run_step(Arc::clone(&ctx), due, retry));
+                    spawn_tracked(&ctx, run_step(Arc::clone(&ctx), due, retry))
                 }
                 Arm::Fire { job, at } => {
-                    tokio::spawn(fire_job_task(Arc::clone(&ctx), job, at, 0));
+                    spawn_tracked(&ctx, fire_job_task(Arc::clone(&ctx), job, at, 0))
                 }
                 Arm::RetryFire {
                     job,
                     claiming,
                     retry,
                     ..
-                } => {
-                    tokio::spawn(fire_job_task(Arc::clone(&ctx), job, claiming, retry));
-                }
+                } => spawn_tracked(&ctx, fire_job_task(Arc::clone(&ctx), job, claiming, retry)),
             }
         }
 
-        let sleep_for = heap
-            .peek()
-            .map(|Reverse(entry)| {
-                Duration::try_from(entry.at.duration_since(now))
-                    .unwrap_or(Duration::ZERO)
-                    .min(MAX_TICK)
-            })
-            .unwrap_or(MAX_TICK);
+        let sleep_for = match heap.peek() {
+            // Overdue entries would otherwise make this a busy loop.
+            _ if draining => MAX_TICK,
+            Some(Reverse(entry)) => Duration::try_from(entry.at.duration_since(now))
+                .unwrap_or(Duration::ZERO)
+                .min(MAX_TICK),
+            None => MAX_TICK,
+        };
 
         tokio::select! {
             _ = tokio::time::sleep(sleep_for) => {}
+            // A drain was called off; overdue entries go now.
+            _ = ctx.wake.notified() => {}
             received = arm.recv() => match received {
                 Some(arm) => {
                     seq += 1;
@@ -1950,7 +2474,11 @@ async fn handle_connection(ctx: Arc<Ctx>, stream: UnixStream) {
             break;
         };
         payload.push('\n');
-        if write.write_all(payload.as_bytes()).await.is_err() {
+        let written = write.write_all(payload.as_bytes()).await;
+        if matches!(response, Response::Upgrading { .. }) {
+            ctx.reply_written.notify_one();
+        }
+        if written.is_err() {
             break;
         }
     }
@@ -1967,12 +2495,22 @@ async fn dispatch(ctx: &Ctx, line: &str) -> Response {
             };
         }
     };
+    // Ahead of the proto check, by design: see `RequestBody::Upgrade`.
+    if let RequestBody::Upgrade { wait_secs, force } = request.body {
+        // Any same-uid client can send this, so bound it here rather than
+        // trust the CLI's check: an unbounded wait overflows the deadline.
+        let wait = Duration::from_secs(wait_secs.min(crate::proto::MAX_UPGRADE_WAIT_SECS));
+        return request_upgrade(ctx, wait, force).await;
+    }
     if request.proto != PROTO_VERSION {
         return Response::ProtoMismatch {
             daemon_proto: PROTO_VERSION,
         };
     }
+    // An upgrade waits for this to finish before it execs.
+    let _work = WorkToken::new(ctx);
     match request.body {
+        RequestBody::Upgrade { .. } => unreachable!("answered above"),
         RequestBody::Ping => Response::Pong {
             proto: PROTO_VERSION,
         },
@@ -2085,6 +2623,31 @@ async fn dispatch(ctx: &Ctx, line: &str) -> Response {
             },
         },
     }
+}
+
+/// Hand the main loop an upgrade and wait for its outcome — which, if it
+/// goes ahead, is the last reply this image ever sends.
+async fn request_upgrade(ctx: &Ctx, wait: Duration, force: bool) -> Response {
+    let Some(upgrades) = &ctx.upgrades else {
+        return Response::Error {
+            message: "this daemon runs in-process and has no binary to re-execute".into(),
+        };
+    };
+    if ctx.upgrading.swap(true, SeqCst) {
+        return Response::Error {
+            message: "an upgrade is already in progress".into(),
+        };
+    }
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    if upgrades.send(UpgradeOrder { wait, force, reply }).is_err() {
+        ctx.upgrading.store(false, SeqCst);
+        return Response::Error {
+            message: "the daemon is shutting down".into(),
+        };
+    }
+    outcome.await.unwrap_or_else(|_| Response::Error {
+        message: "the daemon stopped before the upgrade finished".into(),
+    })
 }
 
 /// §6: the canonical definition, exactly as stored. Rendering — human,
@@ -2504,6 +3067,12 @@ mod tests {
             nudge,
             live: Registry::default(),
             stopping: Arc::default(),
+            work: Arc::new(()),
+            draining: Arc::default(),
+            wake: Arc::default(),
+            upgrades: None,
+            upgrading: Arc::default(),
+            reply_written: Arc::default(),
         })
     }
 

@@ -110,6 +110,12 @@ impl Paths {
         Ok(paths)
     }
 
+    /// The flock beside the socket that makes holding the data lock also
+    /// mean owning the socket (§5.2; see `daemon::acquire_socket_lock`).
+    pub fn socket_lock(&self) -> PathBuf {
+        self.socket_file.with_extension("sock.lock")
+    }
+
     /// Everything one run captured — what §10.2 removes when the run is
     /// pruned.
     pub fn run_log_dir(&self, job: crate::model::JobId, run: crate::model::RunId) -> PathBuf {
@@ -161,6 +167,21 @@ fn safe_component(raw: &str) -> String {
         "_".to_string()
     } else {
         mapped
+    }
+}
+
+/// Take `path`'s exclusive flock without waiting: `None` if another
+/// process holds it. The one definition of "holding a daemon lock", shared
+/// by the daemon, the upgrade handoff check, and uninstall.
+pub fn try_lock(path: &Path) -> Result<Option<std::fs::File>> {
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("creating lock file {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("locking {}", path.display()))
+        }
     }
 }
 
