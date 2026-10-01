@@ -272,6 +272,13 @@ impl Store {
         Ok(Self { writer, reader })
     }
 
+    /// Return every connection and close the pools, so the last one out
+    /// checkpoints the WAL — the store left tidy for an upgrade's exec.
+    pub async fn close(&self) {
+        self.reader.close().await;
+        self.writer.close().await;
+    }
+
     /// The writer, for tests that poke rows directly — it both reads and
     /// writes, and reads through it see everything committed.
     pub fn pool(&self) -> &SqlitePool {

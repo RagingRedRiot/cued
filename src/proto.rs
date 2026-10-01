@@ -2,6 +2,8 @@
 //! one request → one reply, over the §7.3 peer-cred-authenticated socket.
 //! Boring on purpose. No streaming — `cued logs` reads files directly.
 
+use std::path::PathBuf;
+
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +24,10 @@ use crate::model::{
 /// The handshake itself stays wired up, so the mechanism is ready the day
 /// there is something to be compatible *with*.
 pub const PROTO_VERSION: u32 = 1;
+
+/// The longest an upgrade may drain (`RequestBody::Upgrade::wait_secs`).
+/// Enforced by the daemon; the CLI checks it too, to say so politely.
+pub const MAX_UPGRADE_WAIT_SECS: u64 = 24 * 3600;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -74,6 +80,20 @@ pub enum RequestBody {
         run: Option<i64>,
         step: Option<String>,
         attempt: Option<u32>,
+    },
+    /// §5.2 upgrade: finish the running steps, then re-exec the binary this
+    /// daemon was started from, keeping its PID, locks and listening socket.
+    ///
+    /// **Frozen shape, exempt from the proto check.** A new CLI has to be
+    /// able to ask an old daemon to become new, so this request (and its
+    /// three replies) must keep decoding across every future proto bump.
+    /// Never rename or reshape it; add a new verb instead.
+    Upgrade {
+        /// How long to let running steps finish before giving up.
+        wait_secs: u64,
+        /// On timeout, interrupt what is still running (§3.4 Case 2)
+        /// instead of abandoning the upgrade.
+        force: bool,
     },
 }
 
@@ -143,6 +163,19 @@ pub enum Response {
     /// stop the running `cued daemon` and rerun" (§5.1).
     ProtoMismatch {
         daemon_proto: u32,
+    },
+    /// Upgrade (frozen, see `RequestBody::Upgrade`): drained; the daemon is
+    /// re-executing `exe` as this reply is written.
+    Upgrading {
+        exe: PathBuf,
+    },
+    /// Upgrade: `exe` is already the image this daemon is running.
+    UpgradeCurrent {
+        exe: PathBuf,
+    },
+    /// Upgrade: nothing was replaced and the daemon carries on as it was.
+    UpgradeAbandoned {
+        reason: String,
     },
     Error {
         message: String,

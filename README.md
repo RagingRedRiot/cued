@@ -24,6 +24,36 @@ Without setup, the first client starts the daemon on demand.
 Use `cued setup --status` to inspect the installation and
 `cued setup --uninstall` to remove it.
 
+## Upgrade
+
+Install the new build over the old one, then move the running daemon onto it:
+
+```sh
+cargo install --path . --locked
+cued upgrade
+```
+
+The daemon stops starting new steps, lets running ones finish, and re-executes
+the installed binary in place. Its PID, socket, persistence backend, and store
+are kept. Work that came due during the drain runs as soon as the new build is
+up. If steps are still running after `--wait` (default `10m`), the upgrade is
+abandoned and nothing changes; `--force` interrupts them instead, and they
+reconcile per `on_interrupt` as after any restart.
+
+## Uninstall
+
+```sh
+cued uninstall          # add --purge to remove ~/.config/cued too
+cargo uninstall cued
+```
+
+`uninstall` lists what it will delete and asks first: it removes the
+persistence backend, stops the daemon (terminating any running steps), and
+deletes the store, all job history, logs, and the socket. Your config files are
+kept unless you pass `--purge`. The binary belongs to Cargo, so remove it with
+`cargo uninstall`. Off a terminal, `--yes` is required. To keep a job, export it
+first with `cued show ID --toml`.
+
 ## Use
 
 ```sh

@@ -140,6 +140,23 @@ All launchers derive the default socket from the UID:
 unavailable. An inherited `XDG_RUNTIME_DIR` does not change the endpoint.
 `CUED_SOCKET_DIR` explicitly selects an isolated deployment.
 
+`cued upgrade` replaces the daemon's image without a restart. It first runs the
+installed binary with `--version`, refusing one that can't run. The daemon then stops
+popping due work, waits for claimed steps, firings, and request handlers to
+finish, then stops accepting and re-executes the path it started from. The PID,
+both locks, and the listening socket cross the exec, so supervisors see no
+restart, no second daemon can win the lock in between, and clients connecting
+meanwhile queue on the socket. The new image adopts the inherited descriptors
+only after checking that they are this deployment's lock files and socket.
+Then it reconciles as at any startup. If the drain outlasts its wait, the upgrade
+is abandoned unless forced; a forced upgrade interrupts steps as shutdown does.
+If the exec fails, the daemon re-executes its own running image instead, and
+the client, which checks the image actually running, reports the failure. A stop
+signal during the upgrade ends it; the daemon exits instead of re-executing. Waits
+are capped at 24 hours. The
+upgrade request and its replies keep a frozen shape outside the protocol
+version check, so a newer CLI can always ask an older daemon to upgrade.
+
 ### 5.3 Store
 
 SQLite uses WAL, a serialized writer, and a bounded reader pool. The initial
@@ -262,6 +279,20 @@ administrator authorization. Cron supplies startup without supervision.
 
 Installation records its backend so status and uninstall can inspect and remove
 the installation. Setup is a human CLI operation, outside MCP capabilities.
+
+`cued uninstall` removes everything cued put on the account: the backend, then
+the daemon, then the data directory and socket. Removing the backend first means
+systemd stops a supervised daemon itself and nothing restarts it. The client
+then signals the daemon found on the socket at that moment, by pidfd where the
+kernel supports it, so a pid reused since the prompt is never signalled. It
+waits as long as that process lives, since shutdown takes up to the slowest
+step's `kill_grace`. It deletes nothing
+until it holds both daemon locks, which proves no daemon remains and keeps an
+auto-spawned one from opening the store mid-delete. It never auto-spawns.
+Recursive deletes are limited to real directories named `cued`, so an unusual
+XDG value can make uninstall refuse but cannot widen what it deletes. Config is
+user-authored and goes only with `--purge`; linger and the binary belong to
+others and are only reported. Deletion needs interactive confirmation or `--yes`.
 
 ### 8.3 Implementation
 
