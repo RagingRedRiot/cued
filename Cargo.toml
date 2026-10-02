@@ -1,7 +1,8 @@
 [package]
 name = "cued"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
+rust-version = "1.89"
 description = "Durable per-user scheduling of one-off and recurring commands, reminders, and multi-step workflows"
 license = "MIT"
 
@@ -24,6 +25,7 @@ tokio = { version = "1", features = [
     "signal",
     "fs",
     "io-util",
+    "sync",
 ] }
 toml = "0.8"
 zbus = { version = "5.17.0", default-features = false, features = ["tokio"] }
@@ -35,3 +37,13 @@ test-hooks = []
 
 [dev-dependencies]
 tempfile = "3"
+
+# The desktop status window lives beside the CLI so it shares the protocol
+# types. Its graphics stack stays in its own crate: `cargo build` here builds
+# only `cued`, and the static release build never compiles eframe.
+[workspace]
+members = [".", "crates/cued-gui"]
+
+# One version for both binaries: a release tag names them together.
+[workspace.package]
+version = "0.1.0"

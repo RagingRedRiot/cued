@@ -129,6 +129,32 @@ and daemon must belong to the same user. Protocol version remains 1 for this
 unreleased alpha; incompatible or stale daemon responses produce a restart
 instruction. There is no network listener.
 
+A client that wants to follow changes, such as a status window, sends
+`Subscribe` instead of polling. The daemon replies `Subscribed`, then sends
+`Changed` after each commit that `list`, `show`, or `logs` could see. A notice
+names nothing: the subscriber refetches what it shows, so the read requests
+stay the one source of data. Commits that land close together, or while a
+notice is still being written, arrive as one. Nothing is sent while nothing
+changes, and a subscriber's own refetches change nothing: the expiry and
+exhaustion sweeps those reads run write only when they find something. The
+connection takes no further requests; closing it, or sending another line,
+ends the stream.
+
+Notices come from SQLite's hooks on the single writer connection, not from
+each write path, so a new write cannot forget to send one. A change is told
+once the writer is released, because the commit hook runs before the commit
+completes and a subscriber told from there could read the old state. Rolled
+back changes, and §3.5 delivery bookkeeping that no inspection view reads,
+are not told. A failed commit can produce a notice with nothing behind it,
+which costs a refetch; the design accepts that rather than ever missing one.
+
+An upgrade waits for request handlers to finish (§5.2), but not for a
+subscription, which would never finish.
+The exec closes the stream, and the subscriber reconnects to the new image
+and fetches everything again, as it does after any reconnect: notices are
+not stored, and a subscriber learns of what happened while it was away only
+by refetching.
+
 ### 5.2 Daemon lifecycle
 
 Clients start a daemon on demand. A data-directory lock prevents competing
@@ -244,7 +270,8 @@ a command might produce. MCP cannot request environment overrides or `keep_env`.
 
 The stdio server exposes `schedule`, `list`, `show`, `cancel`, and `logs`.
 Scheduling accepts one action or a workflow graph, a time, and optional recurrence.
-There are no MCP approval, installation, daemon, GC, or recovery tools.
+There are no MCP approval, installation, daemon, GC, recovery, or change
+subscription tools.
 
 `mcp.toml` selects `open`, `approve`, or `closed` independently for exec and notify.
 Both default to closed. Read access defaults to on; logs default to off. Each
@@ -343,7 +370,58 @@ Expired jobs without runs age from their durable expiry timestamp.
 
 CLI list, show, logs, and JSON output support inspection. Run and attempt records
 retain outcome and timing information. MCP exports a restricted projection of
-that state; bounded log tails report truncation.
+that state; bounded log tails report truncation. A list entry's latest run
+carries when it started and, while it is live, the step it is at.
+
+`cued-gui` is a desktop status window over the same requests, in its own crate
+so the CLI and daemon never build its graphics stack. It is a client like the
+CLI: it holds a §5.1 subscription and refetches the list and the selected
+job's latest run on each notice, reading a step's log file directly, as `cued
+logs` does. While nothing changes it makes no requests and does not redraw;
+the only timers are a running step's log, re-read each second while it is on
+screen, and elapsed times counting up while a run is shown. It starts a daemon
+when none is running as the window opens, from a `cued` binary it locates, and
+never afterwards: a daemon stopped on purpose stays stopped.
+
+A run is shown as its plan. The attempts come first, in the order they ran,
+each with the transition it took, so a branch or a loop reads as the path the
+run actually followed. A running step lists the transitions it may take, in
+evaluation order. The steps still reachable from the run's cursor follow,
+nearest first; a waiting run's next step says when it starts. Steps the run
+can no longer reach are marked not reached: the branches it didn't take. The
+workflow comes from `show` and is fetched once per job, since a definition
+never changes; each attempt's `outcome_edge` names the transition taken.
+
+The same plan can be drawn as the workflow: a box per step, in columns so each
+step sits right of every step that can lead to it, with an arrow per pair of
+steps a goto joins, labeled with its conditions. A depth-first walk from the
+entry, edges in evaluation order, finds the edges that lead back; those loop
+arrows run along lanes under the boxes and through the gaps between columns,
+so they cross arrows but never a box. A step whose only way on is back sits
+below the main line. The edges the run took are bold, the rest faint, and the
+boxes carry the plan's states. Loops are counted within the run's current
+epoch, as `max_visits` is: a box shows its visits ("×3 of 5" against its
+limit, "×3" without one), an arrow taken more than once carries a "×N"
+badge, and both turn the warning color once a step has used more than half
+its allowed visits. Each attempt's `epoch` comes with it, so a run rewound by
+`cued retry` counts only its current pass. The drawing shrinks to fit the pane, down to
+70%, and scrolls beyond that. End transitions draw no arrow; the list says
+where a run ended.
+
+The window offers continue, retry, pause, resume, and cancel, sending the same
+requests as the CLI verbs; cancel asks first. Each button names what it acts
+on, and the run's come first: continue and retry act on the latest run ("Continue
+from ship", "Retry run"), pause, resume, and cancel on the job ("Pause job"). A
+held run's buttons are set off as what needs doing. Pause stays in place but is
+dimmed, its reason on hover, when the job is already paused or its run is held,
+since nothing new starts then anyway. Otherwise only the verbs that can apply
+to the job as listed are shown, and the daemon's refusal is reported when one
+doesn't.
+It has no approve button: approval binds a definition a person has reviewed
+(§7.6), which stays a terminal review of the exact text. `cued-gui
+--install-desktop` writes a freedesktop launcher entry and icons under
+`$XDG_DATA_HOME`, marked as generated; it never replaces an entry it didn't
+write, and `cued uninstall` removes only a generated one.
 
 `cued wait` (and `--wait` on `at`, `chain`, and `submit`) blocks until a run
 settles, meaning done, failed, held, cancelled, or missed, and exits with a

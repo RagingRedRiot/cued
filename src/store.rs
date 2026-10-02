@@ -13,6 +13,9 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -20,6 +23,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use tokio::sync::watch;
 
 use crate::config::Retention;
 use crate::model::{
@@ -165,7 +169,10 @@ pub struct RunOverview {
     pub id: RunId,
     pub status: RunStatus,
     pub scheduled_for: Timestamp,
+    pub started_at: Option<Timestamp>,
     pub ended_at: Option<Timestamp>,
+    /// The cursor's step while the run is live (not `done`).
+    pub step: Option<StepId>,
     /// The frozen wait target while the cursor is Waiting.
     pub cursor_at: Option<Timestamp>,
     pub fail_reason: Option<String>,
@@ -241,6 +248,23 @@ const READERS: u32 = 4;
 pub struct Store {
     writer: SqlitePool,
     reader: SqlitePool,
+    changes: Arc<watch::Sender<()>>,
+}
+
+/// Tables whose rows the inspection views (list, show, logs) never read:
+/// §3.5 delivery bookkeeping. A change there is not one a viewer can see.
+const UNWATCHED: &[&str] = &["notifications"];
+
+/// What the writer connection's SQLite hooks have seen (§5.1 Subscribe).
+/// One writer connection, so the hooks never race each other; atomics only
+/// because the hooks and the pool's release callback are separate closures.
+#[derive(Debug, Default)]
+struct Dirty {
+    /// A watched row changed in the transaction now open.
+    pending: AtomicBool,
+    /// A transaction that changed a watched row has committed, and nobody
+    /// has been told yet.
+    committed: AtomicBool,
 }
 
 impl Store {
@@ -254,9 +278,55 @@ impl Store {
             .busy_timeout(BUSY_TIMEOUT)
             .foreign_keys(true);
 
+        // §5.1 Subscribe: every committed change to a watched table, told
+        // once the writer is handed back. SQLite's commit hook runs *before*
+        // the commit completes, so a subscriber told from there could read
+        // the old state and keep showing it; by release the commit is done
+        // and every new read sees it. A spurious notice (a commit that then
+        // fails) costs a refetch; a missed one leaves a viewer stale, which
+        // is why this sits under every write rather than beside each one.
+        let (changes, _) = watch::channel(());
+        let changes = Arc::new(changes);
+        let dirty = Arc::new(Dirty::default());
+        let hooked = Arc::clone(&dirty);
+        let released = Arc::clone(&dirty);
+        let told = Arc::clone(&changes);
         let writer = SqlitePoolOptions::new()
             .max_connections(1)
             .acquire_timeout(WRITE_QUEUE_TIMEOUT)
+            // A connection past its lifetime is closed on release without
+            // `after_release` running, which would sit on a notice until
+            // the next write. One writer, kept for the daemon's life.
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .after_connect(move |conn, _| {
+                let dirty = Arc::clone(&hooked);
+                Box::pin(async move {
+                    let mut handle = conn.lock_handle().await?;
+                    let on_update = Arc::clone(&dirty);
+                    handle.set_update_hook(move |change| {
+                        if !UNWATCHED.contains(&change.table) {
+                            on_update.pending.store(true, Relaxed);
+                        }
+                    });
+                    let on_commit = Arc::clone(&dirty);
+                    handle.set_commit_hook(move || {
+                        if on_commit.pending.swap(false, Relaxed) {
+                            on_commit.committed.store(true, Relaxed);
+                        }
+                        true
+                    });
+                    let on_rollback = Arc::clone(&dirty);
+                    handle.set_rollback_hook(move || on_rollback.pending.store(false, Relaxed));
+                    Ok(())
+                })
+            })
+            .after_release(move |_, _| {
+                if released.committed.swap(false, Relaxed) {
+                    told.send_replace(());
+                }
+                Box::pin(async { Ok(true) })
+            })
             .connect_with(options.clone().create_if_missing(true))
             .await
             .with_context(|| format!("opening store at {}", db_file.display()))?;
@@ -278,7 +348,19 @@ impl Store {
             .await
             .with_context(|| format!("opening store readers at {}", db_file.display()))?;
 
-        Ok(Self { writer, reader })
+        Ok(Self {
+            writer,
+            reader,
+            changes,
+        })
+    }
+
+    /// Marks every committed change to what list, show, and logs read
+    /// (§5.1 Subscribe). Changes that land close together arrive as one;
+    /// the receiver says only *that* something changed, so a subscriber
+    /// refetches what it shows. Changes before this call are already seen.
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
     }
 
     /// Return every connection and close the pools, so the last one out
@@ -2077,7 +2159,7 @@ impl Store {
         // Sequential execution (§3) means started_at order is the order the
         // steps ran; attempt breaks ties for a step retried within a run.
         let rows = sqlx::query(
-            "SELECT step_id, attempt, started_at, ended_at, exit_code, timed_out
+            "SELECT step_id, attempt, started_at, ended_at, exit_code, timed_out, outcome_edge, epoch
              FROM step_runs WHERE job_id = ? AND run_id = ?
              ORDER BY started_at, attempt",
         )
@@ -2104,6 +2186,10 @@ impl Store {
                 ended_at,
                 exit_code: row.get("exit_code"),
                 timed_out: row.get::<i64, _>("timed_out") != 0,
+                outcome_edge: row
+                    .get::<Option<i64>, _>("outcome_edge")
+                    .map(|edge| edge as u32),
+                epoch: row.get::<i64, _>("epoch") as u32,
             };
             // Few attempts per run, so filtering here beats building the
             // SQL dynamically for two optional predicates.
@@ -2164,7 +2250,8 @@ impl Store {
             .map(from_ts)
             .transpose()?;
 
-        const COLUMNS: &str = "id, status, ended_at, fail_reason, cursor_kind, cursor_at";
+        const COLUMNS: &str = "id, status, started_at, ended_at, fail_reason, cursor_kind, \
+             cursor_at, CASE WHEN cursor_kind != 'done' THEN cursor_step END AS live_step";
         let run = match query {
             RunQuery::Latest => {
                 sqlx::query(&format!(
@@ -2208,10 +2295,15 @@ impl Store {
                 Some(RunEntry {
                     id: RunId(row.get("id")),
                     status: run_status(row.get("status"))?,
+                    started_at: row
+                        .get::<Option<&str>, _>("started_at")
+                        .map(from_ts)
+                        .transpose()?,
                     ended_at: row
                         .get::<Option<&str>, _>("ended_at")
                         .map(from_ts)
                         .transpose()?,
+                    step: row.get("live_step"),
                     fail_reason: row.get("fail_reason"),
                 })
             }
@@ -2242,8 +2334,9 @@ impl Store {
     pub async fn list_overview(&self, all: bool, now: &Timestamp) -> Result<Vec<JobOverview>> {
         let rows = sqlx::query(
             "SELECT j.id AS job_id, j.name, j.status AS job_status, j.graph, j.next_fire_at, j.approval, j.source, j.expired_at, j.expiry_reason,
-                    r.id AS run_id, r.status AS run_status, r.scheduled_for, r.ended_at,
-                    r.cursor_at, r.fail_reason
+                    r.id AS run_id, r.status AS run_status, r.scheduled_for, r.started_at, r.ended_at,
+                    r.cursor_at, r.fail_reason,
+                    CASE WHEN r.cursor_kind != 'done' THEN r.cursor_step END AS live_step
              FROM jobs j
              LEFT JOIN runs r
                ON r.job_id = j.id
@@ -2261,10 +2354,15 @@ impl Store {
                     id: RunId(run_id),
                     status: run_status(row.get("run_status"))?,
                     scheduled_for: from_ts(row.get("scheduled_for"))?,
+                    started_at: row
+                        .get::<Option<&str>, _>("started_at")
+                        .map(from_ts)
+                        .transpose()?,
                     ended_at: row
                         .get::<Option<&str>, _>("ended_at")
                         .map(from_ts)
                         .transpose()?,
+                    step: row.get("live_step"),
                     cursor_at: row
                         .get::<Option<&str>, _>("cursor_at")
                         .map(from_ts)
@@ -2655,6 +2753,11 @@ mod tests {
             .expect("claimed");
         assert_eq!(attempt, 1);
         assert!(store.waiting_runs().await?.is_empty());
+        // The list shows where a live run is, and since when.
+        let listed = store.list_overview(false, &now).await?;
+        let live = listed[0].last_run.as_ref().unwrap();
+        assert_eq!(live.step.as_deref(), Some("run"));
+        assert_eq!(live.started_at, Some(now));
         // The CAS guard: a duplicate heap entry can't double-claim.
         assert!(store.begin_step(job, run, "run", &now).await?.is_none());
 
@@ -2684,6 +2787,72 @@ mod tests {
         let last = jobs[0].last_run.as_ref().unwrap();
         assert_eq!(last.status, RunStatus::Done);
         assert!(last.ended_at.is_some());
+        assert_eq!(last.step, None, "an ended run is at no step");
+        assert_eq!(last.started_at, Some(now));
+        Ok(())
+    }
+
+    /// Whether a change has been told since the last look. Holding the one
+    /// writer connection proves every earlier write has been released —
+    /// which is where the telling happens — so a `false` here is a fact,
+    /// not a timeout that happened to expire first.
+    async fn told(store: &Store, changes: &mut watch::Receiver<()>) -> Result<bool> {
+        for _ in 0..2 {
+            // The second hold covers the first's own release.
+            drop(store.pool().acquire().await?);
+        }
+        let told = changes.has_changed()?;
+        changes.borrow_and_update();
+        Ok(told)
+    }
+
+    /// §5.1 Subscribe: committed writes are told; reads, writes that change
+    /// nothing, rollbacks, and delivery bookkeeping are not. The no-op case
+    /// is what keeps a viewer from looping: its `list` runs the expiry and
+    /// exhaustion sweeps, which must stay silent when they find nothing.
+    #[tokio::test]
+    async fn committed_changes_are_told_and_nothing_else() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("cued.db")).await?;
+        let mut changes = store.subscribe();
+        let now = Timestamp::now();
+        let at = now.checked_add(jiff::SignedDuration::from_secs(3600))?;
+
+        assert!(
+            !told(&store, &mut changes).await?,
+            "opening is not a change"
+        );
+
+        let (job, _, _) = store
+            .submit_definition(&one_shot_spec(Some("t"), at), &now, JobSource::Cli, true)
+            .await?;
+        assert!(told(&store, &mut changes).await?, "a submit");
+
+        store.expire_pending(&now).await?;
+        store.finish_exhausted_jobs().await?;
+        store.list_overview(true, &now).await?;
+        assert!(
+            !told(&store, &mut changes).await?,
+            "sweeps that found nothing"
+        );
+
+        let mut tx = store.pool().begin().await?;
+        sqlx::query("UPDATE jobs SET name = name WHERE id = ?")
+            .bind(job.0)
+            .execute(&mut *tx)
+            .await?;
+        tx.rollback().await?;
+        assert!(!told(&store, &mut changes).await?, "a rolled-back write");
+
+        // The approval submit queued a notification; marking it delivered
+        // changes nothing list, show, or logs read.
+        let pending = store.undelivered_notifications().await?;
+        assert_eq!(pending.len(), 1);
+        store.mark_delivered(pending[0].id, None, &now).await?;
+        assert!(!told(&store, &mut changes).await?, "delivery bookkeeping");
+
+        store.cancel_job(job, &now).await?;
+        assert!(told(&store, &mut changes).await?, "a cancel");
         Ok(())
     }
 

@@ -46,7 +46,7 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: cargo test
@@ -59,7 +59,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --locked
+      - run: cargo test --workspace --locked
 
   # DESIGN.md §7.1: protect one user's jobs from other local users. Two real
   # UIDs in a container each take a turn as owner: the owner is served, and the

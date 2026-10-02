@@ -1,21 +1,125 @@
-# cued
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.png">
+    <img src="docs/assets/banner-light.png" alt="cued" width="100%">
+  </picture>
+</p>
 
-A per-user scheduler for Linux. Run commands, send desktop reminders, and build
-workflows with conditional transitions and waits that survive daemon restarts.
-The CLI and stdio MCP server share the same daemon and job store.
+<p align="center">
+  <b>Schedule commands, reminders, and workflows that survive restarts.</b><br>
+  A per-user scheduler for Linux, driven from your terminal or by an AI assistant over MCP,<br>
+  with an optional desktop window to watch your runs.
+</p>
 
-Early alpha: commands, storage, and protocols may change without compatibility
-support. Interrupted commands can require human review; cued does not guarantee
-exactly-once external effects.
+<p align="center">
+  <a href="https://github.com/RagingRedRiot/cued/actions/workflows/ci.yml"><img src="https://github.com/RagingRedRiot/cued/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/RagingRedRiot/cued/releases/latest"><img src="https://img.shields.io/github/v/release/RagingRedRiot/cued" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/rust-1.89%2B-orange.svg?logo=rust" alt="Rust 1.89+">
+</p>
 
-## Install
+<p align="center">
+  <a href="#install-and-upgrade"><b>Install</b></a> ·
+  <a href="#quick-start"><b>Quick start</b></a> ·
+  <a href="#status-window"><b>Status window</b></a> ·
+  <a href="docs/cli.md"><b>CLI guide</b></a> ·
+  <a href="docs/mcp.md"><b>MCP</b></a> ·
+  <a href="DESIGN.md"><b>Design</b></a>
+</p>
 
-Build and install with Rust and Cargo from this checkout:
+<p align="center">
+  <img src="docs/assets/demo.gif" alt="Scheduling a reminder, a daily backup and a build-then-test chain with cued, waiting on the chain, then listing jobs and reading its logs" width="100%">
+</p>
+
+- **Survives restarts.** Jobs and workflow positions live in SQLite. After a
+  crash, reboot, or upgrade the daemon picks up where it left off, and a run
+  that was interrupted is held for your review instead of blindly retried.
+- **Workflows, not just timers.** Run steps in order with `cued chain`, or
+  write a TOML workflow that branches on exit status, with durable waits
+  between steps.
+- **Times the way you say them.** `"9am tomorrow"`, `"in 1h"`, `every "day 09:00"`,
+  in any IANA time zone. Desktop reminders included.
+- **Built for AI assistants.** An MCP server with per-capability policy and
+  human approval, and `cued wait`, so an agent can wait on a job without
+  spending tokens.
+- **A status window, if you want one.** `cued-gui` shows what is running,
+  waiting, and done, step by step, like a CI page for your machine, with each
+  workflow drawn as a graph of the path it took.
+- **Upgrades in place.** `cued upgrade` moves the running daemon onto a new
+  build without losing its jobs, socket, or persistence setup.
+- **Yours alone.** Runs per user, with no root. Other local users are refused
+  by file permissions and by the daemon's kernel peer-credential check.
+
+> [!WARNING]
+> Early alpha: commands, storage, and protocols may change without compatibility
+> support. Interrupted commands can require human review; cued does not guarantee
+> exactly-once external effects.
+
+## Install and upgrade
+
+cued is a daemon and CLI first; the status window is optional. Pick the route
+that fits how you'll use it. Each is one download, or one `cargo install`:
+
+| Route | Installs | For |
+| --- | --- | --- |
+| **Headless** | `cued` | servers, SSH sessions, scripts, AI agents |
+| **Desktop** | `cued` and `cued-gui` | a desktop where you want to watch your runs |
+
+Installing and upgrading are the same steps: put the new binaries in place,
+then run `cued setup` the first time or `cued upgrade` after that.
+
+### Release download
+
+Checked against their published checksums, for x86_64 Linux.
+
+**Headless:** a single static binary.
 
 ```sh
-cargo install --path . --locked
-cued setup
+base=https://github.com/RagingRedRiot/cued/releases/latest/download
+curl -fLO "$base/cued-x86_64-linux.tar.gz" -O "$base/cued-x86_64-linux.tar.gz.sha256"
+sha256sum -c cued-x86_64-linux.tar.gz.sha256
+tar -xzf cued-x86_64-linux.tar.gz cued
+install -D -m 755 cued ~/.local/bin/cued
+cued setup                    # first install; `cued upgrade` when updating
 ```
+
+**Desktop:** the same `cued`, with the status window.
+
+```sh
+base=https://github.com/RagingRedRiot/cued/releases/latest/download
+curl -fLO "$base/cued-desktop-x86_64-linux.tar.gz" -O "$base/cued-desktop-x86_64-linux.tar.gz.sha256"
+sha256sum -c cued-desktop-x86_64-linux.tar.gz.sha256
+tar -xzf cued-desktop-x86_64-linux.tar.gz cued cued-gui
+install -D -m 755 -t ~/.local/bin cued cued-gui
+cued setup                    # first install; `cued upgrade` when updating
+cued-gui --install-desktop    # add cued to your applications list
+```
+
+The window needs a Wayland or X11 desktop with OpenGL and glibc 2.35 or newer;
+`cued` itself runs on any x86_64 Linux. To add the window to a headless
+install later, install the desktop archive over it: its `cued` is the same
+binary.
+
+While the repository is private, those URLs need GitHub access; fetch the same
+files with `gh release download --repo RagingRedRiot/cued --pattern 'cued-x86_64-*'`
+(headless) or `--pattern 'cued-desktop-*'` (desktop). Any directory on your
+`PATH` works in place of `~/.local/bin`.
+
+### Cargo
+
+If you have Rust, build and install from source:
+
+```sh
+# Headless
+cargo install --git https://github.com/RagingRedRiot/cued --locked cued
+
+# Desktop: both in one command (the window needs Rust 1.95 or later)
+cargo install --git https://github.com/RagingRedRiot/cued --locked cued cued-gui
+```
+
+Then `cued setup`, and for the desktop route `cued-gui --install-desktop`.
+
+### Setup
 
 `setup` offers the persistence backends available on your machine: a systemd user
 service, systemd with linger, or cron `@reboot`. Linger can require administrator
@@ -24,14 +128,13 @@ Without setup, the first client starts the daemon on demand.
 Use `cued setup --status` to inspect the installation and
 `cued setup --uninstall` to remove it.
 
-## Upgrade
+### Upgrade
 
-Install the new build over the old one, then move the running daemon onto it:
-
-```sh
-cargo install --path . --locked
-cued upgrade
-```
+`install` and `cargo install` both replace the file rather than write into it,
+so the running daemon is untouched until `cued upgrade`. Upgrade `cued` and
+`cued-gui` together, and reopen the window after `cued upgrade` so it runs the
+new build too. Plain `cp` can't
+write over a running binary and fails with "Text file busy".
 
 The daemon stops starting new steps, lets running ones finish, and re-executes
 the installed binary in place. Its PID, socket, persistence backend, and store
@@ -40,101 +143,55 @@ up. If steps are still running after `--wait` (default `10m`), the upgrade is
 abandoned and nothing changes; `--force` interrupts them instead, and they
 reconcile per `on_interrupt` as after any restart.
 
-## Uninstall
+## Quick start
 
 ```sh
-cued uninstall          # add --purge to remove ~/.config/cued too
-cargo uninstall cued
+cued remind "25m" "stretch"                        # a desktop notification
+cued every "day 09:00" -- ./backup.sh              # a recurring command
+cued chain ./build.sh --then ./test.sh --wait      # steps, then wait for the result
+cued list                                          # what's scheduled and how it went
+cued logs j3                                       # captured output, step by step
 ```
 
-`uninstall` lists what it will delete and asks first: it removes the
-persistence backend, stops the daemon (terminating any running steps), and
-deletes the store, all job history, logs, and the socket. Your config files are
-kept unless you pass `--purge`. The binary belongs to Cargo, so remove it with
-`cargo uninstall`. Off a terminal, `--yes` is required. To keep a job, export it
-first with `cued show ID --toml`.
+`cued wait` exits with the run's outcome (0 done, 3 failed, 4 held, and so
+on), so scripts and agents can act on it. A run held after an interruption
+can be inspected, then resumed with `cued continue` or rerun with `cued retry`.
+The [CLI guide](docs/cli.md) covers waiting, pausing, recovery, and exports;
+`cued --help` has every option.
 
-## Use
+## Status window
 
-```sh
-cued at "9am tomorrow" -- ./backup.sh
-cued remind "1h" "stretch"
-cued every "30m" -- ./sync.sh
-cued chain "./build.sh" --then "./test.sh"
-cued submit flow.toml
-cued list
-cued show j1
-cued logs j1 -f
-cued wait j1
-cued cancel j1
-```
+<p align="center">
+  <img src="docs/assets/status-window.png" alt="The cued status window: jobs grouped into needs attention, up next, and recent on the left; on the right a failed workflow drawn as a graph, with a test step that looped through clear-cache twice, a deploy that failed into rollback, and a smoke-test step marked not reached" width="100%">
+</p>
 
-`wait` blocks until a job's run ends and exits with its outcome:
+`cued-gui` is a desktop window for your runs, like a CI status page for your
+machine. Jobs are grouped by what they need: held runs and approvals first,
+then what is running and at which step, what is up next, and how recent runs
+ended. Select one to follow its latest run:
 
-| Exit | Meaning |
-| --- | --- |
-| 0 | done |
-| 3 | failed |
-| 4 | held: needs `cued continue` or `cued retry` |
-| 5 | ended: cancelled, missed, expired, or out of runs |
-| 6 | `--wait` only: the job was submitted, but waiting on it failed |
-| 124 | `--timeout` ran out |
-| 1 | cued itself failed, including no daemon running |
-| 2 | usage error, including a bad `--timeout` |
+- **As a list:** each step in the order it ran, its exit code, timing, and
+  the transition it took (`failed → goto rollback`); then the steps still
+  ahead, and the branches the run can no longer reach.
+- **As a graph:** the workflow drawn left to right, the path taken in bold and
+  untaken branches faint. Loops show how often they ran (`×2 of 3` against
+  `max_visits`) and turn amber as a step nears its limit.
+- **With its output:** each step's log, followed live while it runs.
+- **With controls:** continue or retry a held run; pause, resume, or cancel
+  the job. Approving a job stays at the terminal.
 
-It waits for the run in progress, or else the next one to fire, and reports
-a held run right away. A job that finished its schedule answers with its
-last run. A cancelled or expired job has ended (5), whatever its last run
-did; the summary still names that run. Skipped firings (overlap or
-catch-up) are records, not runs, so `wait` passes over them. `--run N`
-means exactly that run: a skipped one is reported as itself (5), and one not
-created yet is waited for while the job can still fire.
-
-On a paused job, `wait` still waits out a step that is executing, since that
-step finishes regardless, and `wait --run N` still reports a run that has
-already settled. Anything else would need the job to move, so `wait` refuses
-it (exit 1): a run between steps or not yet started, or a run not yet
-created. That includes plain `cued wait` once the latest run has settled,
-since it would then be waiting for the next one. A paused job starts none of
-those until `cued resume`. While the next firing is far off, `wait`
-sleeps toward it instead of polling every second, waking at least every 30
-seconds, so a cancel or retry is noticed within that.
-
-`wait` never starts a daemon: with none running it exits 1 rather than
-wait, since nothing would finish the run. It rides out a restart or upgrade
-of up to a minute, and says whether the daemon is gone or running but not
-answering. A socket it can't use at all (permissions, say) fails at once
-with the real cause.
-
-`at`, `chain`, and `submit` accept `--wait` to submit and wait in one
-command. Like every flag of `at` and `every`, it goes before the time:
-`cued at --wait "in 1h" ./backup.sh`. Everything after the time is the
-command, so cued refuses a flag of its own typed there (exit 2) rather than
-pass it to the command; after `--` it is passed on, with a note. It is the plain form, with no `--timeout` or `--json`; scripts
-should submit, then run `cued wait`. If the daemon would refuse the wait
-(MCP `read` off), `--wait` says so before submitting, and nothing is created.
-Exit 6 is for a wait that fails after the job exists; it tells a retrying
-wrapper not to submit again, since `cued wait ID` picks the job up.
-
-`pause` stops new work while allowing a claimed step to finish. `resume` allows
-work to proceed again. A run held after an interruption can be inspected, then
-continued or retried with `cued continue ID` or `cued retry ID`.
-
-Jobs capture their working directory and environment at submission. `show ID`
-lists captured and stripped variable names; `show ID --json` deliberately exposes
-captured values for local troubleshooting. `show ID --toml` exports an editable
-workflow. See `cued --help` and [the design](DESIGN.md) for scheduling, workflow,
-and recovery semantics.
+It follows the daemon's change stream, so it makes no requests and doesn't
+redraw while nothing changes. It starts the daemon if none is running, from
+the `cued` beside it or on your `PATH` (`--no-auto-start` to leave it
+stopped).
 
 ## MCP
 
 Configure an AI client to launch `cued` with arguments `["mcp"]`. It serves
-stdio only and exposes exactly `schedule`, `list`, `show`, `cancel`, and `logs`.
-Scheduling accepts either one action (`exec` argv or `notify` title/body) or a
-workflow graph of those actions, at one time and optionally recurring. Recovery
-controls remain CLI work.
-
-The server reads `~/.config/cued/mcp.toml` (`$XDG_CONFIG_HOME/cued/mcp.toml`):
+`schedule`, `list`, `show`, `cancel`, and `logs` over stdio. Running commands
+and sending notifications stay off until you allow them in
+`~/.config/cued/mcp.toml`; job status is readable, and captured output is not,
+by default:
 
 ```toml
 exec = "approve"    # open | approve | closed; default closed
@@ -143,121 +200,9 @@ read = "on"         # list/show; on | off
 logs = "off"        # captured output; on | off
 ```
 
-Override the path with `CUED_MCP_CONFIG`, or values with `CUED_MCP_EXEC`,
-`CUED_MCP_NOTIFY`, `CUED_MCP_READ`, and `CUED_MCP_LOGS`. These settings belong
-only to the MCP server; the daemon's `config.toml` is unchanged. Closed tools
-name the setting and resolved file needed to enable them. Capability checks re-read the file, so edits apply to a running server.
-
-Example `schedule` arguments:
-
-```json
-{"action":{"type":"exec","argv":["/home/me/bin/backup"]},"at":"in 1h","every":"24h","count":7}
-```
-
-For reminders, use `{"type":"notify","title":"Stretch","body":"Take a break"}`
-as the action. Calendar recurrence such as `"every":"day 09:00"` carries its
-own time and omits `at`; `zone` selects an IANA time zone. Relative times are
-resolved once, at submission. Environment is captured under the normal secrets
-denylist for execution, but MCP cannot see captured environment variable names
-or values; this is intentional, to keep host configuration and secrets out of
-model-visible responses. A human troubleshooting a job can run `cued show ID`
-to see captured and denylist-stripped variable names, or `cued show ID --json`
-to inspect the actual captured values locally. MCP cannot request `keep_env`
-or arbitrary overrides.
-
-For dependent commands, pass a `workflow` instead of `action`. `entry` names
-the first step; `steps` is an object keyed by step id. Each step has an `action`
-and an optional ordered `transitions` array. A transition has `when` and `then`;
-the first matching condition wins. Conditions use cued's graph forms such as
-`"succeeded"`, `"failed"`, `"timed_out"`, `"always"`, or `{"exit_eq":0}`.
-Effects use `{"goto":{"step":"test"}}` or
-`{"end":{"outcome":"failure"}}`. For example:
-
-```json
-{
-  "workflow": {
-    "entry": "build",
-    "steps": {
-      "build": {
-        "action": {"type":"exec","argv":["make","build"]},
-        "transitions": [
-          {"when":"succeeded","then":{"goto":{"step":"test"}}},
-          {"when":"failed","then":{"goto":{"step":"notify_failure"}}}
-        ]
-      },
-      "test": {
-        "action": {"type":"exec","argv":["make","test"]},
-        "transitions": [
-          {"when":"failed","then":{"goto":{"step":"notify_failure"}}},
-          {"when":"succeeded","then":{"end":{"outcome":"success"}}}
-        ]
-      },
-      "notify_failure": {
-        "action": {"type":"notify","title":"Build failed","body":"Check cued logs"},
-        "transitions": [
-          {"when":"always","then":{"end":{"outcome":"failure"}}}
-        ]
-      }
-    }
-  },
-  "at":"in 1h"
-}
-```
-
-Every exec step uses the `exec` capability and every notify step uses
-`notify`; mixed workflows require both capabilities to be enabled. If either
-capability is set to `approve`, the entire workflow waits for approval. Graphs
-go through cued's normal validation, including target and loop checks.
-
-A pending job does nothing until a human runs `cued approve j7`, reviews the
-stored definition, and confirms. Cancel denies it. One-shot approval must
-arrive before its scheduled instant; recurring pending approval expires after
-seven days. Expiry releases the name and retains the audit record under normal
-retention. Approval lasts across recurring firings, binds actual stored fields
-including captured environment, and does not freeze referenced file contents.
-List/show omit captured environment and approval hashes, and show approval and expiry status.
-
-`logs` is separately disabled by default because it sends captured output to
-the client. When enabled it returns a bounded tail (16 KiB by default, at most
-64 KiB via `max_bytes`) and reports truncation. The approval mechanism is a
-same-user guardrail, not a security boundary against deliberate CLI use.
-
-### Waiting on a job
-
-MCP has no wait tool. A blocking tool call would tie up the session and run
-into client timeouts. Waiting is the CLI's `cued wait` instead, meant for an
-agent's background shell (in Claude Code, a background Bash command). The
-agent schedules a workflow, starts `cued wait j7` in the background, and ends
-its turn. cued runs the steps, conditions, and waits. The agent spends no
-tokens or context until the run ends. Then `wait` exits, the client wakes the
-agent, and it reads a few lines: the outcome, the steps that ran with their
-exit codes when the policy allows them, and an exit status it can act on.
-
-This is deliberate. If you use the MCP server to limit what a model can do,
-you can allowlist exactly one shell command, `cued wait` (in Claude Code, a
-permission rule such as `Bash(cued wait:*)`), and still give the agent cheap,
-durable waits. `wait` changes nothing, and it reports no more than MCP would:
-
-- **The outcome** (status, failure reason, end time) is job status, governed
-  by `read`. With `read = "off"`, the daemon refuses every `wait` poll,
-  including `--wait` on a submitting command.
-- **Each step's exit code and timing** are what MCP's `logs` tool exposes,
-  so the daemon sends them only while `logs` is on. `logs` is off by default,
-  so by default `wait` reports the outcome alone, and anyone, you included,
-  reads step results with `cued logs`.
-- **Captured output, environment, and the commands a job runs** are never
-  printed.
-
-The daemon enforces this, not the client, and re-reads the policy on every
-poll. It uses its own environment, and for `wait` the settings only tighten:
-`off` in its default `mcp.toml`, in the file named by its `CUED_MCP_CONFIG`,
-or in its `CUED_MCP_READ` / `CUED_MCP_LOGS` wins, and nothing turns a switch
-back on. Nothing set in the waiter's shell counts, and `wait` never starts a
-daemon, which would inherit that shell's environment. So set the policy in
-`mcp.toml`. An override passed only in the MCP server's launch config
-reaches the daemon only if that server happened to start it. When that
-leaves `wait` looser than the server, `cued mcp` prints a warning at
-startup.
+With `approve`, a job the model schedules does nothing until you run
+`cued approve ID` and confirm it. See [MCP](docs/mcp.md) for workflows over
+MCP, environment handling, and how agents wait on jobs.
 
 ## Reliability and retention
 
@@ -273,12 +218,31 @@ recovery policy holds interrupted runs for review instead of retrying them.
 `cued gc` prunes retained history and logs. Defaults keep up to 20 runs per job
 and remove terminal runs older than 30 days. Active and held runs are protected.
 
+## Uninstall
+
+```sh
+cued uninstall                                # add --purge to remove ~/.config/cued too
+rm ~/.local/bin/cued ~/.local/bin/cued-gui    # or `cargo uninstall cued cued-gui`
+```
+
+`uninstall` lists what it will delete and asks first: it removes the
+persistence backend, stops the daemon (terminating any running steps), and
+deletes the store, all job history, logs, and the socket, and the status
+window's launcher entry if you installed one. Your config files are kept
+unless you pass `--purge`. The binaries are yours to remove, as above. Off
+a terminal, `--yes` is required. To keep a job, export it first with
+`cued show ID --toml`.
+
 ## Development
 
 ```sh
-cargo test --release
-cargo clippy --release --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+The repository is a Cargo workspace: `cued` at the root, the status window in
+`crates/cued-gui`. A plain `cargo build` builds only `cued`, so the CLI and
+daemon never compile the window's graphics stack.
 
 The cross-user access test (DESIGN.md §7.1) needs Docker. It runs the daemon
 as two real UIDs in a locked-down container and checks that the owner is served

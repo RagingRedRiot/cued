@@ -2470,6 +2470,10 @@ async fn handle_connection(ctx: Arc<Ctx>, stream: UnixStream) {
     let mut lines = BufReader::new(read).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let response = dispatch(&ctx, &line).await;
+        if matches!(response, Response::Subscribed) {
+            stream_changes(&ctx, lines, write).await;
+            return;
+        }
         let Ok(mut payload) = serde_json::to_string(&response) else {
             break;
         };
@@ -2480,6 +2484,41 @@ async fn handle_connection(ctx: Arc<Ctx>, stream: UnixStream) {
         }
         if written.is_err() {
             break;
+        }
+    }
+}
+
+/// §5.1 Subscribe: `Subscribed`, then a `Changed` per store change (several
+/// close together arrive as one), until the client hangs up or writes again.
+/// Holds no `WorkToken`: a subscriber stays connected indefinitely, and an
+/// upgrade waits for every token to drop. Its exec closes this socket, and
+/// the subscriber reconnects to the new image.
+async fn stream_changes(
+    ctx: &Ctx,
+    mut lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    mut write: tokio::net::unix::OwnedWriteHalf,
+) {
+    // Before the reply: whatever commits once the client has it is told.
+    let mut changes = ctx.store.subscribe();
+    let mut notice = Response::Subscribed;
+    loop {
+        let Ok(mut payload) = serde_json::to_string(&notice) else {
+            return;
+        };
+        payload.push('\n');
+        if write.write_all(payload.as_bytes()).await.is_err() {
+            return;
+        }
+        tokio::select! {
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    return; // the store is gone: the daemon is stopping
+                }
+                changes.borrow_and_update();
+                notice = Response::Changed;
+            }
+            // EOF, an error, or a line: the stream takes no requests.
+            _ = lines.next_line() => return,
         }
     }
 }
@@ -2507,10 +2546,14 @@ async fn dispatch(ctx: &Ctx, line: &str) -> Response {
             daemon_proto: PROTO_VERSION,
         };
     }
+    // Ahead of the work token: the stream that follows is long-lived.
+    if let RequestBody::Subscribe = request.body {
+        return Response::Subscribed;
+    }
     // An upgrade waits for this to finish before it execs.
     let _work = WorkToken::new(ctx);
     match request.body {
-        RequestBody::Upgrade { .. } => unreachable!("answered above"),
+        RequestBody::Upgrade { .. } | RequestBody::Subscribe => unreachable!("answered above"),
         RequestBody::Ping => Response::Pong {
             proto: PROTO_VERSION,
         },
@@ -2921,7 +2964,9 @@ async fn handle_list(ctx: &Ctx, all: bool) -> Result<Vec<JobEntry>> {
             last_run: overview.last_run.map(|run| RunEntry {
                 id: run.id,
                 status: run.status,
+                started_at: run.started_at,
                 ended_at: run.ended_at,
+                step: run.step,
                 fail_reason: run.fail_reason,
             }),
         })

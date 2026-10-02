@@ -1,6 +1,7 @@
 //! The CLI ↔ daemon wire protocol (DESIGN.md §5.1): newline-delimited JSON,
 //! one request → one reply, over the §7.3 peer-cred-authenticated socket.
-//! Boring on purpose. No streaming — `cued logs` reads files directly.
+//! Boring on purpose. The one stream is `Subscribe`'s, and it carries only
+//! "something changed", never data — `cued logs` reads files directly.
 
 use std::path::PathBuf;
 
@@ -87,6 +88,12 @@ pub enum RequestBody {
     /// `--wait`'s check before submitting: whether `Runs` would be refused,
     /// so a job is never created only to be refused a wait.
     WaitAllowed,
+    /// §5.1: turn this connection into a change stream. The daemon replies
+    /// `Subscribed`, then `Changed` after each commit that list, show, or
+    /// logs could see, coalescing ones that land close together. Nothing
+    /// else is read from the connection: the client closing it, or sending
+    /// anything more, ends the stream. Not offered over MCP.
+    Subscribe,
     /// §5.2 upgrade: finish the running steps, then re-exec the binary this
     /// daemon was started from, keeping its PID, locks and listening socket.
     ///
@@ -162,6 +169,12 @@ pub enum Response {
     JobRun(Box<JobRun>),
     /// Reply to `WaitAllowed` when it is.
     WaitAllowed,
+    /// Reply to `Subscribe`: the stream is open, and any change from here
+    /// on will be told. Fetch everything shown now; only `Changed` follows.
+    Subscribed,
+    /// On a subscribed connection: something committed since the last
+    /// notice. Refetch what is shown.
+    Changed,
     /// The job is cancelled; `runs` are the runs that were live and have
     /// been marked `Cancelled` (their processes, if any, are being torn
     /// down per §2.2 — the reply doesn't wait out `kill_grace`).
@@ -194,7 +207,7 @@ pub enum Response {
 
 /// One `cued list` row: the job, when it next fires (or was scheduled for),
 /// and where its latest run stands.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobEntry {
     pub id: JobId,
     pub name: Option<String>,
@@ -260,7 +273,7 @@ pub struct RunSteps {
 /// here: §5.1 keeps the socket control-plane only and has `cued logs` read
 /// the per-attempt file directly — they're the user's own files, and it
 /// makes `-f` a plain tail instead of a streaming protocol.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogAttempt {
     pub step: StepId,
     pub attempt: u32,
@@ -278,13 +291,27 @@ pub struct LogAttempt {
     pub running: bool,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    /// Which of the step's transitions the run took when this attempt
+    /// closed, by index (§3.2). `None` while it is open, or when no
+    /// transition matched and the run ended on the attempt's own result.
+    pub outcome_edge: Option<u32>,
+    /// The run's rewind generation when this attempt began (§3.4): `cued
+    /// retry` starts a new one, and `max_visits` counts within it. Defaults
+    /// to 0, a run never rewound, for a daemon too old to send it.
+    #[serde(default)]
+    pub epoch: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEntry {
     pub id: RunId,
     pub status: RunStatus,
+    /// When its first step began; `None` until then.
+    pub started_at: Option<Timestamp>,
     pub ended_at: Option<Timestamp>,
+    /// The step a live run is at: executing, waiting to, or held at it.
+    /// `None` once the run is over.
+    pub step: Option<StepId>,
     /// §3.2: `deadline` | `max_visits` | … — why it failed, when the answer
     /// isn't "the command did". Without this the store records a reason
     /// nothing ever shows.
