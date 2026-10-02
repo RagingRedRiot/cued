@@ -9,6 +9,48 @@ mod ui_tests;
 
 use std::path::{Path, PathBuf};
 
+/// The launcher icons `--install-desktop` writes, one per hicolor size in
+/// [`cued::desktop::SIZES`].
+pub fn launcher_icons() -> [cued::desktop::Icon; 7] {
+    use cued::desktop::Icon;
+    [
+        Icon {
+            size: "16x16",
+            bytes: include_bytes!("../assets/icon-16.png"),
+        },
+        Icon {
+            size: "32x32",
+            bytes: include_bytes!("../assets/icon-32.png"),
+        },
+        Icon {
+            size: "64x64",
+            bytes: include_bytes!("../assets/icon-64.png"),
+        },
+        Icon {
+            size: "128x128",
+            bytes: include_bytes!("../assets/icon-128.png"),
+        },
+        Icon {
+            size: "256x256",
+            bytes: include_bytes!("../assets/icon-256.png"),
+        },
+        Icon {
+            size: "512x512",
+            bytes: include_bytes!("../assets/icon-512.png"),
+        },
+        Icon {
+            size: "scalable",
+            bytes: include_bytes!("../assets/icon.svg"),
+        },
+    ]
+}
+
+/// The window and taskbar icon.
+pub fn window_icon() -> eframe::egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png"))
+        .expect("bundled icon is a valid PNG")
+}
+
 /// The `cued` binary that starts a daemon: `CUED_EXECUTABLE`, else the one
 /// beside this binary, else the first on `PATH`. A daemon started from the
 /// window's own binary would be a second window, not a daemon.
@@ -42,6 +84,17 @@ fn executable(path: &Path) -> bool {
 mod tests {
     use super::find_cued;
     use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+
+    #[test]
+    fn bundled_icons_decode_and_cover_every_size() {
+        let icon = super::window_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        let sizes: Vec<_> = super::launcher_icons()
+            .iter()
+            .map(|icon| icon.size)
+            .collect();
+        assert_eq!(sizes, cued::desktop::SIZES);
+    }
 
     fn executable(path: &Path) {
         fs::write(path, "fixture").unwrap();

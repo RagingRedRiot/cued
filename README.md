@@ -124,18 +124,27 @@ The [CLI guide](docs/cli.md) covers waiting, pausing, recovery, and exports;
 
 `cued-gui` is a desktop window for your runs, like a CI status page: what is
 running and at which step, what is up next, what needs attention, and how
-recent runs ended, with each step's exit code, timing, and output. It follows
-the daemon's change stream, so it does nothing while nothing changes.
+recent runs ended, with each step's exit code, timing, and output. Continue,
+retry, pause, resume, and cancel are a click away; approving a job stays at
+the terminal. It follows the daemon's change stream, so it does nothing while
+nothing changes.
 
 ```sh
-cargo install --git https://github.com/RagingRedRiot/cued --locked cued-gui
-cued-gui
+curl -fLO "$base/cued-gui-x86_64-linux.tar.gz" -O "$base/cued-gui-x86_64-linux.tar.gz.sha256"
+sha256sum -c cued-gui-x86_64-linux.tar.gz.sha256
+tar -xzf cued-gui-x86_64-linux.tar.gz cued-gui
+install -D -m 755 cued-gui ~/.local/bin/cued-gui
+cued-gui --install-desktop      # add it to your applications list
 ```
 
+With `$base` as in [Release download](#release-download), or from source with
+`cargo install --git https://github.com/RagingRedRiot/cued --locked cued-gui`
+(Rust 1.95 or later). It needs a Wayland or X11 desktop with OpenGL, and runs
+on glibc 2.35 or newer.
+
 It starts the daemon if none is running, from the `cued` beside it or on your
-`PATH` (`--no-auto-start` to leave it stopped). It needs a Wayland or X11
-desktop with OpenGL, and Rust 1.95 or later to build; it is not yet part of
-the release downloads.
+`PATH` (`--no-auto-start` to leave it stopped). `cued uninstall` removes the
+launcher entry along with everything else.
 
 ## MCP
 

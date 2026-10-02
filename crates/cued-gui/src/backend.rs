@@ -9,6 +9,7 @@
 //! The only timer is the log tail of a step that is running, re-read once a
 //! second while it is on screen: a step's output is a file, and the daemon
 //! sends no notice per line.
+use crate::model::Verb;
 use cued::client::{self, CallError, Subscription};
 use cued::model::{JobId, RunId};
 use cued::paths::Paths;
@@ -66,6 +67,9 @@ pub enum Update {
         run: RunId,
         log: Log,
     },
+    /// What a [`Command::Act`] did, in a sentence. Its effect on the job
+    /// arrives as a change notice like any other.
+    Acted(Result<String, String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +78,7 @@ pub enum Command {
     /// Show this attempt's log, or `None` for the running or latest one.
     ShowLog(Option<(String, u32)>),
     StartDaemon,
+    Act(JobId, Verb),
 }
 
 enum Message {
@@ -277,6 +282,12 @@ impl Fetcher {
                         detail = true;
                     }
                     Message::Command(Command::StartDaemon) => self.start_daemon(),
+                    Message::Command(Command::Act(job, verb)) => {
+                        let outcome = act(&self.paths, job, verb);
+                        if !self.send(Update::Acted(outcome)) {
+                            return;
+                        }
+                    }
                 }
             }
             if self.link != Link::Live {
@@ -410,6 +421,31 @@ impl Fetcher {
             text,
             truncated,
         }
+    }
+}
+
+/// One control request, as the CLI would send it.
+fn act(paths: &Paths, job: JobId, verb: Verb) -> Result<String, String> {
+    let reference = job.to_string();
+    let body = match verb {
+        Verb::Continue => RequestBody::Continue { job: reference },
+        Verb::Retry => RequestBody::Retry {
+            job: reference,
+            from: None,
+        },
+        Verb::Pause => RequestBody::Pause { job: reference },
+        Verb::Resume => RequestBody::Resume { job: reference },
+        Verb::Cancel => RequestBody::Cancel { job: reference },
+    };
+    match client::call(paths, body).map_err(|error| error.to_string())? {
+        Response::Rearmed { job, run, step } if verb == Verb::Continue => {
+            Ok(format!("{job}.{run} continuing from {step}"))
+        }
+        Response::Rearmed { job, run, step } => Ok(format!("{job}.{run} rerunning from {step}")),
+        Response::Paused { job } => Ok(format!("{job} paused")),
+        Response::Resumed { job, .. } => Ok(format!("{job} resumed")),
+        Response::JobCancelled { job, .. } => Ok(format!("{job} cancelled")),
+        other => Err(client::unexpected(other).to_string()),
     }
 }
 

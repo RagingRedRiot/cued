@@ -18,6 +18,7 @@
 //! - [`notify`]    — durable notification queue + delivery (§3.5)
 //! - [`persist`]   — `PersistenceBackend`: systemd --user / cron @reboot (§8)
 //! - [`config`]    — `~/.config/cued/config.toml` defaults (§10.1)
+//! - [`desktop`]   — the status window's launcher entry and icons (§10.3)
 //! - [`paths`]     — XDG locations for socket, store, logs, config (§5, §7.4)
 //! - [`testhook`]  — feature-gated fault points for real-process tests (§11)
 
@@ -26,6 +27,7 @@ pub mod client;
 pub mod clock;
 pub mod config;
 pub mod daemon;
+pub mod desktop;
 pub mod exec;
 pub mod export;
 pub mod model;

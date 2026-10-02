@@ -383,6 +383,15 @@ screen, and elapsed times counting up while a run is shown. It starts a daemon
 when none is running as the window opens, from a `cued` binary it locates, and
 never afterwards: a daemon stopped on purpose stays stopped.
 
+The window offers continue, retry, pause, resume, and cancel, sending the same
+requests as the CLI verbs; cancel asks first. It shows only the verbs that can
+apply to the job as listed, and reports the daemon's refusal when one doesn't.
+It has no approve button: approval binds a definition a person has reviewed
+(§7.6), which stays a terminal review of the exact text. `cued-gui
+--install-desktop` writes a freedesktop launcher entry and icons under
+`$XDG_DATA_HOME`, marked as generated; it never replaces an entry it didn't
+write, and `cued uninstall` removes only a generated one.
+
 `cued wait` (and `--wait` on `at`, `chain`, and `submit`) blocks until a run
 settles, meaning done, failed, held, cancelled, or missed, and exits with a
 status that encodes the outcome. A held run counts as settled because it

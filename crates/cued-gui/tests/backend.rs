@@ -12,6 +12,7 @@ use cued::paths::Paths;
 use cued::proto::{RequestBody, Response};
 use cued::store::Store;
 use cued_gui::backend::{Backend, Command, Detail, Link, Update};
+use cued_gui::model::Verb;
 use jiff::{SignedDuration, Timestamp};
 
 struct NoBusNotifier;
@@ -167,5 +168,73 @@ fn a_daemon_started_after_the_window_is_picked_up() {
     });
     until(&backend, Duration::from_secs(10), |update| {
         matches!(update, Update::Jobs(Ok(_)))
+    });
+}
+
+#[test]
+fn controls_reach_the_daemon_and_their_effect_arrives_as_a_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = temp_paths(dir.path());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    start_daemon(&runtime, &paths);
+    while cued::client::call(&paths, RequestBody::Ping).is_err() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let backend = Backend::start(paths.clone(), None, false, || {});
+    until(&backend, Duration::from_secs(10), |update| {
+        matches!(update, Update::Jobs(Ok(_)))
+    });
+    // Due in an hour: pausing it is a pure state change.
+    let spec = JobSpec {
+        name: None,
+        schedule: Schedule::Once {
+            at: Timestamp::now()
+                .checked_add(SignedDuration::from_secs(3600))
+                .unwrap(),
+        },
+        graph: cued::submit::single_shell_graph(vec!["/usr/bin/true".into()]),
+        cwd: "/".into(),
+        env: CapturedEnv::default(),
+        policies: Policies::default(),
+        hooks: Hooks::default(),
+    };
+    let job = match cued::client::call(
+        &paths,
+        RequestBody::Submit {
+            spec: Box::new(spec),
+        },
+    )
+    .unwrap()
+    {
+        Response::Submitted { job, .. } => job,
+        other => panic!("expected Submitted, got {other:?}"),
+    };
+
+    backend.send(Command::Act(job, Verb::Pause));
+    let (mut acted, mut listed) = (false, false);
+    until(&backend, Duration::from_secs(10), |update| {
+        match update {
+            Update::Acted(outcome) => {
+                assert_eq!(outcome, &Ok(format!("{job} paused")));
+                acted = true;
+            }
+            Update::Jobs(Ok(jobs)) => {
+                listed |= jobs
+                    .iter()
+                    .any(|entry| entry.id == job && entry.status == JobStatus::Paused);
+            }
+            _ => {}
+        }
+        acted && listed
+    });
+
+    // A refusal comes back as the daemon's words.
+    backend.send(Command::Act(job, Verb::Continue));
+    until(&backend, Duration::from_secs(10), |update| match update {
+        Update::Acted(Err(message)) => {
+            assert!(message.contains("isn't held"), "{message}");
+            true
+        }
+        _ => false,
     });
 }

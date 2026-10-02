@@ -24,8 +24,8 @@ pub mod icon {
     pub const X_CIRCLE: &str = "\u{E4F8}";
 }
 
-/// Colors for one theme. Neutrals are slate, from the app icon; the single
-/// accent is the icon's teal, used for focus, selection, and what is new.
+/// Colors for one theme. Neutrals are slate; the single accent is cued's
+/// blue, from the logo, used for focus, selection, and what is running.
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
     /// Behind the panels.
@@ -64,9 +64,9 @@ pub const LIGHT: Palette = Palette {
     text: Color32::from_rgb(0x0F, 0x17, 0x2A),
     muted: Color32::from_rgb(0x55, 0x60, 0x72),
     faint: Color32::from_rgb(0x8A, 0x94, 0xA6),
-    accent: Color32::from_rgb(0x2D, 0x9C, 0xBA),
-    accent_text: Color32::from_rgb(0x1A, 0x78, 0x93),
-    accent_soft: Color32::from_rgb(0xDF, 0xF1, 0xF6),
+    accent: Color32::from_rgb(0x00, 0x57, 0xFC),
+    accent_text: Color32::from_rgb(0x00, 0x47, 0xCF),
+    accent_soft: Color32::from_rgb(0xE3, 0xEC, 0xFF),
     danger: Color32::from_rgb(0xC9, 0x37, 0x30),
     warning: Color32::from_rgb(0xA8, 0x6A, 0x0C),
     warning_soft: Color32::from_rgb(0xFB, 0xEE, 0xD5),
@@ -84,9 +84,9 @@ pub const DARK: Palette = Palette {
     text: Color32::from_rgb(0xE6, 0xEA, 0xF0),
     muted: Color32::from_rgb(0x9A, 0xA4, 0xB5),
     faint: Color32::from_rgb(0x6A, 0x75, 0x88),
-    accent: Color32::from_rgb(0x3F, 0xB4, 0xD4),
-    accent_text: Color32::from_rgb(0x6C, 0xC8, 0xE2),
-    accent_soft: Color32::from_rgb(0x12, 0x34, 0x40),
+    accent: Color32::from_rgb(0x3B, 0x7B, 0xFF),
+    accent_text: Color32::from_rgb(0x82, 0xA9, 0xFF),
+    accent_soft: Color32::from_rgb(0x12, 0x24, 0x4D),
     danger: Color32::from_rgb(0xEF, 0x6F, 0x68),
     warning: Color32::from_rgb(0xE3, 0xAE, 0x4A),
     warning_soft: Color32::from_rgb(0x3A, 0x2C, 0x12),

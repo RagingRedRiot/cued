@@ -297,6 +297,64 @@ pub fn default_attempt(attempts: &[LogAttempt]) -> Option<&LogAttempt> {
         .or(attempts.last())
 }
 
+/// What a viewer can do to a job, mirroring the CLI verbs of the same names.
+/// Approval is deliberately absent: it stays a review at a terminal (§7.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    Continue,
+    Retry,
+    Pause,
+    Resume,
+    Cancel,
+}
+
+impl Verb {
+    pub fn label(self) -> &'static str {
+        match self {
+            Verb::Continue => "Continue",
+            Verb::Retry => "Retry",
+            Verb::Pause => "Pause",
+            Verb::Resume => "Resume",
+            Verb::Cancel => "Cancel",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Verb::Continue => "Resume the held run from the step it stopped at",
+            Verb::Retry => "Run the latest run again, from the held step or the start",
+            Verb::Pause => "Start no new work; a step already running finishes",
+            Verb::Resume => "Let the job start work again",
+            Verb::Cancel => "Stop the job for good, terminating any running step",
+        }
+    }
+}
+
+/// The verbs that apply to a job as it stands, in button order. The daemon
+/// has the last word; this only keeps buttons that can't work off screen.
+pub fn verbs(job: &JobEntry) -> Vec<Verb> {
+    let mut verbs = Vec::new();
+    let approved = !awaiting_approval(job) && job.status != JobStatus::Expired;
+    match run_status(job) {
+        Some(RunStatus::Held) if approved => verbs.extend([Verb::Continue, Verb::Retry]),
+        Some(RunStatus::Done | RunStatus::Failed | RunStatus::Missed | RunStatus::Cancelled)
+            if approved =>
+        {
+            verbs.push(Verb::Retry)
+        }
+        _ => {}
+    }
+    match job.status {
+        JobStatus::Active if !awaiting_approval(job) => verbs.push(Verb::Pause),
+        JobStatus::Paused if !awaiting_approval(job) => verbs.push(Verb::Resume),
+        _ => {}
+    }
+    if job.status.is_live() {
+        verbs.push(Verb::Cancel);
+    }
+    verbs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +426,30 @@ mod tests {
             job_summary(&held, at(0)),
             "held at deploy · cued continue or retry"
         );
+    }
+
+    #[test]
+    fn verbs_follow_the_job_and_its_run() {
+        use Verb::*;
+        let held = job(1, JobStatus::Active, Some(run(RunStatus::Held)));
+        assert_eq!(verbs(&held), [Continue, Retry, Pause, Cancel]);
+        let running = job(2, JobStatus::Active, Some(run(RunStatus::Running)));
+        assert_eq!(verbs(&running), [Pause, Cancel]);
+        let paused = job(3, JobStatus::Paused, Some(run(RunStatus::Done)));
+        assert_eq!(verbs(&paused), [Retry, Resume, Cancel]);
+        let failed = job(4, JobStatus::Done, Some(run(RunStatus::Failed)));
+        assert_eq!(verbs(&failed), [Retry]);
+        let expired = job(5, JobStatus::Expired, None);
+        assert_eq!(verbs(&expired), []);
+        let mut pending = job(6, JobStatus::Active, None);
+        pending.approval = Some(Approval {
+            state: ApprovalState::Pending,
+            definition_hash: [0; 32],
+            approved_at: None,
+        });
+        assert_eq!(verbs(&pending), [Cancel], "approval stays at the terminal");
+        let skipped = job(7, JobStatus::Done, Some(run(RunStatus::Skipped)));
+        assert_eq!(verbs(&skipped), []);
     }
 
     #[test]

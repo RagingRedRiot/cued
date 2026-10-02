@@ -2,6 +2,7 @@
 //! accessibility tree, with the backend's two ends held by the test.
 use crate::app::App;
 use crate::backend::{Backend, Command, Detail, Link, Log, Update};
+use crate::model::Verb;
 use cued::model::{JobId, JobSource, JobStatus, RunId, RunStatus};
 use cued::proto::{JobEntry, LogAttempt, RunEntry};
 use egui_kittest::{Harness, kittest::Queryable};
@@ -222,4 +223,74 @@ fn an_empty_list_says_how_to_schedule_something() {
     ui.send(Update::Link(Link::Live));
     ui.send(Update::Jobs(Ok(Vec::new())));
     ui.harness.get_by_label("Nothing scheduled.");
+}
+
+fn select_held(ui: &mut Ui) {
+    ui.send(Update::Link(Link::Live));
+    ui.send(Update::Jobs(Ok(jobs())));
+    ui.harness
+        .get_by_label("j2 deploy, held, Needs attention")
+        .click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::Select(Some(JobId(2))));
+}
+
+#[test]
+fn controls_act_on_the_selected_job_and_report_back() {
+    let mut ui = Ui::new();
+    select_held(&mut ui);
+    for label in ["Continue", "Retry", "Pause", "Cancel"] {
+        ui.harness.get_by_label(label);
+    }
+    assert!(ui.harness.query_by_label("Resume").is_none());
+
+    ui.harness.get_by_label("Continue").click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::Act(JobId(2), Verb::Continue));
+    // No second request while the first is unanswered.
+    ui.harness.get_by_label("Retry").click();
+    ui.settle();
+    assert!(
+        ui.commands.try_recv().is_err(),
+        "a button stayed live mid-request"
+    );
+
+    ui.send(Update::Acted(Ok("j2.r1 continuing from ship".into())));
+    ui.harness.get_by_label("j2.r1 continuing from ship");
+    ui.harness.get_by_label("Dismiss").click();
+    ui.settle();
+    assert!(
+        ui.harness
+            .query_by_label("j2.r1 continuing from ship")
+            .is_none()
+    );
+
+    ui.harness.get_by_label("Retry").click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::Act(JobId(2), Verb::Retry));
+    ui.send(Update::Acted(Err("j2.r1 is still live".into())));
+    ui.harness.get_by_label("j2.r1 is still live");
+}
+
+#[test]
+fn cancel_asks_first() {
+    let mut ui = Ui::new();
+    select_held(&mut ui);
+
+    ui.harness.get_by_label("Cancel").click();
+    ui.settle();
+    ui.harness.get_by_label("Cancel j2 deploy?");
+    ui.harness.get_by_label("Keep it").click();
+    ui.settle();
+    assert!(ui.harness.query_by_label("Cancel j2 deploy?").is_none());
+    assert!(
+        ui.commands.try_recv().is_err(),
+        "kept, yet something was sent"
+    );
+
+    ui.harness.get_by_label("Cancel").click();
+    ui.settle();
+    ui.harness.get_by_label("Cancel job").click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::Act(JobId(2), Verb::Cancel));
 }

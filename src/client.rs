@@ -2548,6 +2548,13 @@ fn uninstall(paths: &Paths, purge: bool, yes: bool) -> Result<()> {
     if purge && let Some(dir) = config_dir.as_ref().filter(|dir| dir.exists()) {
         println!("  - {} (your config)", dir.display());
     }
+    let launcher = crate::desktop::read_entry(paths)? == crate::desktop::Entry::Generated;
+    if launcher {
+        println!(
+            "  - the status window's launcher, {}, and its icons",
+            crate::desktop::entry_path(paths)?.display()
+        );
+    }
     println!("Kept:");
     if !purge && let Some(dir) = config_dir.as_ref().filter(|dir| dir.exists()) {
         println!("  - {} (your config; --purge removes it)", dir.display());
@@ -2621,6 +2628,9 @@ Delete all of this? It cannot be undone. [y/N] "
         && remove_owned_dir(dir)?
     {
         removed.push(dir.clone());
+    }
+    if launcher && let Some(entry) = crate::desktop::remove(paths)? {
+        removed.push(entry);
     }
     for path in &removed {
         println!("removed {}", path.display());

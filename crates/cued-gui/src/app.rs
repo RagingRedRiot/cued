@@ -4,7 +4,7 @@
 //! clicks. It repaints when the backend has something new, and once a second
 //! only while a run on screen is counting up.
 use crate::backend::{Backend, Command, Detail, Link, Update};
-use crate::model::{self, Mark, Section, Tone};
+use crate::model::{self, Mark, Section, Tone, Verb};
 use crate::theme::{self, Palette, icon};
 use cued::model::JobId;
 use cued::proto::JobEntry;
@@ -21,6 +21,12 @@ pub struct App {
     selected: Option<JobId>,
     detail: Option<Result<Detail, String>>,
     log_choice: Option<(String, u32)>,
+    /// A control request sent and not yet answered: its buttons are off.
+    acting: Option<(JobId, Verb)>,
+    /// What the last control request did, until dismissed.
+    outcome: Option<Result<String, String>>,
+    /// A cancel waiting for confirmation.
+    confirm_cancel: Option<JobId>,
 }
 
 impl App {
@@ -33,6 +39,9 @@ impl App {
             selected: None,
             detail: None,
             log_choice: None,
+            acting: None,
+            outcome: None,
+            confirm_cancel: None,
         }
     }
 
@@ -67,7 +76,25 @@ impl App {
                     detail.log = Some(log);
                 }
             }
+            Update::Acted(outcome) => {
+                self.acting = None;
+                self.outcome = Some(outcome);
+            }
         }
+    }
+
+    fn act(&mut self, job: JobId, verb: Verb) {
+        if verb == Verb::Cancel {
+            self.confirm_cancel = Some(job);
+        } else {
+            self.send_act(job, verb);
+        }
+    }
+
+    fn send_act(&mut self, job: JobId, verb: Verb) {
+        self.acting = Some((job, verb));
+        self.outcome = None;
+        self.backend.send(Command::Act(job, verb));
     }
 
     fn select(&mut self, job: JobId) {
@@ -112,6 +139,11 @@ impl App {
         egui::Panel::top("bar")
             .frame(panel(12, 8))
             .show(ui, |ui| self.bar(ui));
+        if self.outcome.is_some() {
+            egui::Panel::top("outcome")
+                .frame(panel(12, 6))
+                .show(ui, |ui| self.outcome_bar(ui));
+        }
         egui::Panel::left("jobs")
             .default_size(400.0)
             .frame(panel(10, 10))
@@ -123,6 +155,75 @@ impl App {
                     .inner_margin(16),
             )
             .show(ui, |ui| self.detail(ui, now));
+        self.cancel_modal(ui);
+    }
+
+    fn outcome_bar(&mut self, ui: &mut egui::Ui) {
+        let p = Palette::of(ui.visuals());
+        let Some(outcome) = &self.outcome else {
+            return;
+        };
+        let (glyph, color, text) = match outcome {
+            Ok(text) => (icon::CHECK_CIRCLE, p.success, text),
+            Err(text) => (icon::WARNING_CIRCLE, p.danger, text),
+        };
+        let mut dismiss = false;
+        ui.horizontal(|ui| {
+            ui.label(theme::glyph(glyph).color(color));
+            ui.add(egui::Label::new(RichText::new(text).color(color)).truncate())
+                .on_hover_text(text);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                dismiss = ui.small_button("Dismiss").clicked();
+            });
+        });
+        if dismiss {
+            self.outcome = None;
+        }
+    }
+
+    fn cancel_modal(&mut self, ui: &mut egui::Ui) {
+        let Some(job) = self.confirm_cancel else {
+            return;
+        };
+        let title = self
+            .jobs
+            .iter()
+            .flatten()
+            .find(|entry| entry.id == job)
+            .map(model::job_title)
+            .unwrap_or_else(|| job.to_string());
+        let p = Palette::of(ui.visuals());
+        let mut confirmed = false;
+        let mut kept = false;
+        let modal = egui::Modal::new(egui::Id::new("confirm_cancel"))
+            .frame(egui::Frame::popup(ui.style()).inner_margin(18))
+            .show(ui.ctx(), |ui| {
+                ui.set_max_width(360.0);
+                ui.label(RichText::new(format!("Cancel {title}?")).heading());
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "It won't run again, and a step running now is terminated. \
+                     This can't be undone.",
+                    )
+                    .color(p.muted),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    confirmed = ui
+                        .add(egui::Button::new(
+                            RichText::new("Cancel job").color(p.danger),
+                        ))
+                        .clicked();
+                    kept = ui.button("Keep it").clicked();
+                });
+            });
+        if confirmed {
+            self.confirm_cancel = None;
+            self.send_act(job, Verb::Cancel);
+        } else if kept || modal.should_close() {
+            self.confirm_cancel = None;
+        }
     }
 
     fn bar(&mut self, ui: &mut egui::Ui) {
@@ -210,12 +311,18 @@ impl App {
         let job = self
             .jobs
             .as_ref()
-            .and_then(|jobs| jobs.iter().find(|job| job.id == selected));
+            .and_then(|jobs| jobs.iter().find(|job| job.id == selected))
+            .cloned();
         let Some(job) = job else {
             ui.label(RichText::new(format!("{selected} is no longer listed.")).color(p.muted));
             return;
         };
+        let job = &job;
         header(ui, job, now);
+        let busy = self.acting.is_some_and(|(acting, _)| acting == job.id);
+        if let Some(verb) = controls(ui, job, busy) {
+            self.act(job.id, verb);
+        }
         ui.add_space(12.0);
         let detail = match &self.detail {
             None => {
@@ -357,6 +464,34 @@ fn job_row(
         &format!("{title}, {}, {}", mark.label, section.title()),
     );
     response
+}
+
+/// The job's control buttons; the one clicked, if any.
+fn controls(ui: &mut egui::Ui, job: &JobEntry, busy: bool) -> Option<Verb> {
+    let verbs = model::verbs(job);
+    if verbs.is_empty() {
+        return None;
+    }
+    let p = Palette::of(ui.visuals());
+    let mut clicked = None;
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(!busy, |ui| {
+            for verb in verbs {
+                let text = RichText::new(verb.label());
+                let text = if verb == Verb::Cancel {
+                    text.color(p.danger)
+                } else {
+                    text
+                };
+                let button = egui::Button::new(text).stroke(egui::Stroke::new(1.0, p.hairline));
+                if ui.add(button).on_hover_text(verb.hint()).clicked() {
+                    clicked = Some(verb);
+                }
+            }
+        });
+    });
+    clicked
 }
 
 /// The selected job: mark, title, command, and its run's timing.

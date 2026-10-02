@@ -1,6 +1,6 @@
 [package]
 name = "cued"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.89"
 description = "Durable per-user scheduling of one-off and recurring commands, reminders, and multi-step workflows"
@@ -43,3 +43,7 @@ tempfile = "3"
 # only `cued`, and the static release build never compiles eframe.
 [workspace]
 members = [".", "crates/cued-gui"]
+
+# One version for both binaries: a release tag names them together.
+[workspace.package]
+version = "0.1.0"
