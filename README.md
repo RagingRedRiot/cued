@@ -7,7 +7,8 @@
 
 <p align="center">
   <b>Schedule commands, reminders, and workflows that survive restarts.</b><br>
-  A per-user scheduler for Linux, driven from your terminal or by an AI assistant over MCP.
+  A per-user scheduler for Linux, driven from your terminal or by an AI assistant over MCP,<br>
+  with an optional desktop window to watch your runs.
 </p>
 
 <p align="center">
@@ -20,6 +21,7 @@
 <p align="center">
   <a href="#install-and-upgrade"><b>Install</b></a> ·
   <a href="#quick-start"><b>Quick start</b></a> ·
+  <a href="#status-window"><b>Status window</b></a> ·
   <a href="docs/cli.md"><b>CLI guide</b></a> ·
   <a href="docs/mcp.md"><b>MCP</b></a> ·
   <a href="DESIGN.md"><b>Design</b></a>
@@ -40,6 +42,9 @@
 - **Built for AI assistants.** An MCP server with per-capability policy and
   human approval, and `cued wait`, so an agent can wait on a job without
   spending tokens.
+- **A status window, if you want one.** `cued-gui` shows what is running,
+  waiting, and done, step by step, like a CI page for your machine, with each
+  workflow drawn as a graph of the path it took.
 - **Upgrades in place.** `cued upgrade` moves the running daemon onto a new
   build without losing its jobs, socket, or persistence setup.
 - **Yours alone.** Runs per user, with no root. Other local users are refused
@@ -52,13 +57,22 @@
 
 ## Install and upgrade
 
-Installing and upgrading are the same steps: put the new binary in place, then
-run `cued setup` the first time or `cued upgrade` after that.
+cued is a daemon and CLI first; the status window is optional. Pick the route
+that fits how you'll use it. Each is one download, or one `cargo install`:
+
+| Route | Installs | For |
+| --- | --- | --- |
+| **Headless** | `cued` | servers, SSH sessions, scripts, AI agents |
+| **Desktop** | `cued` and `cued-gui` | a desktop where you want to watch your runs |
+
+Installing and upgrading are the same steps: put the new binaries in place,
+then run `cued setup` the first time or `cued upgrade` after that.
 
 ### Release download
 
-A single static binary for x86_64 Linux, checked against its published
-checksum:
+Checked against their published checksums, for x86_64 Linux.
+
+**Headless:** a single static binary.
 
 ```sh
 base=https://github.com/RagingRedRiot/cued/releases/latest/download
@@ -66,21 +80,44 @@ curl -fLO "$base/cued-x86_64-linux.tar.gz" -O "$base/cued-x86_64-linux.tar.gz.sh
 sha256sum -c cued-x86_64-linux.tar.gz.sha256
 tar -xzf cued-x86_64-linux.tar.gz cued
 install -D -m 755 cued ~/.local/bin/cued
-cued setup      # first install; `cued upgrade` when updating
+cued setup                    # first install; `cued upgrade` when updating
 ```
 
+**Desktop:** the same `cued`, with the status window.
+
+```sh
+base=https://github.com/RagingRedRiot/cued/releases/latest/download
+curl -fLO "$base/cued-desktop-x86_64-linux.tar.gz" -O "$base/cued-desktop-x86_64-linux.tar.gz.sha256"
+sha256sum -c cued-desktop-x86_64-linux.tar.gz.sha256
+tar -xzf cued-desktop-x86_64-linux.tar.gz cued cued-gui
+install -D -m 755 -t ~/.local/bin cued cued-gui
+cued setup                    # first install; `cued upgrade` when updating
+cued-gui --install-desktop    # add cued to your applications list
+```
+
+The window needs a Wayland or X11 desktop with OpenGL and glibc 2.35 or newer;
+`cued` itself runs on any x86_64 Linux. To add the window to a headless
+install later, install the desktop archive over it: its `cued` is the same
+binary.
+
 While the repository is private, those URLs need GitHub access; fetch the same
-files with `gh release download --repo RagingRedRiot/cued --pattern 'cued-*'`.
-Any directory on your `PATH` works in place of `~/.local/bin`.
+files with `gh release download --repo RagingRedRiot/cued --pattern 'cued-x86_64-*'`
+(headless) or `--pattern 'cued-desktop-*'` (desktop). Any directory on your
+`PATH` works in place of `~/.local/bin`.
 
 ### Cargo
 
 If you have Rust, build and install from source:
 
 ```sh
+# Headless
 cargo install --git https://github.com/RagingRedRiot/cued --locked cued
-cued setup      # first install; `cued upgrade` when updating
+
+# Desktop: both in one command (the window needs Rust 1.95 or later)
+cargo install --git https://github.com/RagingRedRiot/cued --locked cued cued-gui
 ```
+
+Then `cued setup`, and for the desktop route `cued-gui --install-desktop`.
 
 ### Setup
 
@@ -94,7 +131,9 @@ Use `cued setup --status` to inspect the installation and
 ### Upgrade
 
 `install` and `cargo install` both replace the file rather than write into it,
-so the running daemon is untouched until `cued upgrade`. Plain `cp` can't
+so the running daemon is untouched until `cued upgrade`. Upgrade `cued` and
+`cued-gui` together, and reopen the window after `cued upgrade` so it runs the
+new build too. Plain `cp` can't
 write over a running binary and fails with "Text file busy".
 
 The daemon stops starting new steps, lets running ones finish, and re-executes
@@ -122,29 +161,29 @@ The [CLI guide](docs/cli.md) covers waiting, pausing, recovery, and exports;
 
 ## Status window
 
-`cued-gui` is a desktop window for your runs, like a CI status page: what is
-running and at which step, what is up next, what needs attention, and how
-recent runs ended, with each step's exit code, timing, and output. Continue,
-retry, pause, resume, and cancel are a click away; approving a job stays at
-the terminal. It follows the daemon's change stream, so it does nothing while
-nothing changes.
+<p align="center">
+  <img src="docs/assets/status-window.png" alt="The cued status window: jobs grouped into needs attention, up next, and recent on the left; on the right a failed workflow drawn as a graph, with a test step that looped through clear-cache twice, a deploy that failed into rollback, and a smoke-test step marked not reached" width="100%">
+</p>
 
-```sh
-curl -fLO "$base/cued-gui-x86_64-linux.tar.gz" -O "$base/cued-gui-x86_64-linux.tar.gz.sha256"
-sha256sum -c cued-gui-x86_64-linux.tar.gz.sha256
-tar -xzf cued-gui-x86_64-linux.tar.gz cued-gui
-install -D -m 755 cued-gui ~/.local/bin/cued-gui
-cued-gui --install-desktop      # add it to your applications list
-```
+`cued-gui` is a desktop window for your runs, like a CI status page for your
+machine. Jobs are grouped by what they need: held runs and approvals first,
+then what is running and at which step, what is up next, and how recent runs
+ended. Select one to follow its latest run:
 
-With `$base` as in [Release download](#release-download), or from source with
-`cargo install --git https://github.com/RagingRedRiot/cued --locked cued-gui`
-(Rust 1.95 or later). It needs a Wayland or X11 desktop with OpenGL, and runs
-on glibc 2.35 or newer.
+- **As a list:** each step in the order it ran, its exit code, timing, and
+  the transition it took (`failed → goto rollback`); then the steps still
+  ahead, and the branches the run can no longer reach.
+- **As a graph:** the workflow drawn left to right, the path taken in bold and
+  untaken branches faint. Loops show how often they ran (`×2 of 3` against
+  `max_visits`) and turn amber as a step nears its limit.
+- **With its output:** each step's log, followed live while it runs.
+- **With controls:** continue or retry a held run; pause, resume, or cancel
+  the job. Approving a job stays at the terminal.
 
-It starts the daemon if none is running, from the `cued` beside it or on your
-`PATH` (`--no-auto-start` to leave it stopped). `cued uninstall` removes the
-launcher entry along with everything else.
+It follows the daemon's change stream, so it makes no requests and doesn't
+redraw while nothing changes. It starts the daemon if none is running, from
+the `cued` beside it or on your `PATH` (`--no-auto-start` to leave it
+stopped).
 
 ## MCP
 
@@ -182,23 +221,28 @@ and remove terminal runs older than 30 days. Active and held runs are protected.
 ## Uninstall
 
 ```sh
-cued uninstall          # add --purge to remove ~/.config/cued too
-rm ~/.local/bin/cued    # or `cargo uninstall cued` if Cargo installed it
+cued uninstall                                # add --purge to remove ~/.config/cued too
+rm ~/.local/bin/cued ~/.local/bin/cued-gui    # or `cargo uninstall cued cued-gui`
 ```
 
 `uninstall` lists what it will delete and asks first: it removes the
 persistence backend, stops the daemon (terminating any running steps), and
-deletes the store, all job history, logs, and the socket. Your config files are
-kept unless you pass `--purge`. The binary is yours to remove, as above. Off
+deletes the store, all job history, logs, and the socket, and the status
+window's launcher entry if you installed one. Your config files are kept
+unless you pass `--purge`. The binaries are yours to remove, as above. Off
 a terminal, `--yes` is required. To keep a job, export it first with
 `cued show ID --toml`.
 
 ## Development
 
 ```sh
-cargo test --release
-cargo clippy --release --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+The repository is a Cargo workspace: `cued` at the root, the status window in
+`crates/cued-gui`. A plain `cargo build` builds only `cued`, so the CLI and
+daemon never compile the window's graphics stack.
 
 The cross-user access test (DESIGN.md §7.1) needs Docker. It runs the daemon
 as two real UIDs in a locked-down container and checks that the owner is served

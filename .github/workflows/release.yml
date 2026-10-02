@@ -1,8 +1,9 @@
 name: Release
 
-# Publishes the binaries users download: pushing a version tag (v0.2.0) builds
-# a static x86_64 cued and the cued-gui status window, and attaches both, with
-# their checksums, to a GitHub release.
+# Publishes the archives users download: pushing a version tag (v0.2.0) builds
+# a static x86_64 cued and the cued-gui status window, and attaches two
+# archives, with their checksums, to a GitHub release: cued alone, for
+# headless use, and cued with cued-gui, for a desktop. Both hold the same cued.
 #
 #   git tag v0.2.0 && git push origin v0.2.0
 #
@@ -11,7 +12,7 @@ name: Release
 #
 # Asset names carry no version, so
 # releases/latest/download/cued-x86_64-linux.tar.gz always names the newest
-# release (and likewise cued-gui-x86_64-linux.tar.gz). That URL skips prereleases, so releases are never marked as one.
+# release (and likewise cued-desktop-x86_64-linux.tar.gz). That URL skips prereleases, so releases are never marked as one.
 
 on:
   push:
@@ -24,7 +25,7 @@ env:
   CARGO_TERM_COLOR: always
   TARGET: x86_64-unknown-linux-musl
   ASSET: cued-x86_64-linux.tar.gz
-  GUI_ASSET: cued-gui-x86_64-linux.tar.gz
+  DESKTOP_ASSET: cued-desktop-x86_64-linux.tar.gz
 
 jobs:
   # Read-only token: building runs every dependency's build script. Only the
@@ -88,8 +89,11 @@ jobs:
   # Wayland/X11 libraries at run time. Built on the oldest supported runner,
   # so it needs only that glibc (2.35) and runs on older distributions too.
   # Same read-only token as `build`; the tag checks there gate publishing.
+  # Waits for `build` so the desktop archive carries its cued: the static
+  # binary the access fixture ran against, not a second build of it.
   build-gui:
     name: build-gui
+    needs: build
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -105,18 +109,24 @@ jobs:
           set -euo pipefail
           ldd target/release/cued-gui
           target/release/cued-gui --version
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: headless/
       # The fonts are compiled in, so their licenses travel with the binary.
       - name: Package
         run: |
           set -euo pipefail
+          (cd headless && sha256sum -c "$ASSET.sha256")
           mkdir -p stage dist
+          tar -C stage -xzf "headless/$ASSET" cued
           cp target/release/cued-gui LICENSE README.md \
             crates/cued-gui/assets/fonts/Inter-LICENSE.txt \
             crates/cued-gui/assets/fonts/Phosphor-LICENSE.txt stage/
-          tar -C stage -czf "dist/$GUI_ASSET" \
-            cued-gui LICENSE README.md Inter-LICENSE.txt Phosphor-LICENSE.txt
-          (cd dist && sha256sum "$GUI_ASSET" > "$GUI_ASSET.sha256")
-          cat "dist/$GUI_ASSET.sha256"
+          tar -C stage -czf "dist/$DESKTOP_ASSET" \
+            cued cued-gui LICENSE README.md Inter-LICENSE.txt Phosphor-LICENSE.txt
+          (cd dist && sha256sum "$DESKTOP_ASSET" > "$DESKTOP_ASSET.sha256")
+          cat "dist/$DESKTOP_ASSET.sha256"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-gui
