@@ -269,6 +269,10 @@ impl App {
     }
 
     fn job_list(&mut self, ui: &mut egui::Ui, now: Timestamp) {
+        // A side panel takes the size of what it drew. Claim the width it
+        // offers, or a short first frame ("Loading…", the empty-list hint)
+        // shrinks it for good, and its default size and dragging stop working.
+        ui.set_min_width(ui.available_width());
         let p = Palette::of(ui.visuals());
         if let Some(error) = &self.jobs_error {
             ui.add(egui::Label::new(RichText::new(error).color(p.danger)).wrap());
