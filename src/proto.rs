@@ -207,7 +207,7 @@ pub enum Response {
 
 /// One `cued list` row: the job, when it next fires (or was scheduled for),
 /// and where its latest run stands.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobEntry {
     pub id: JobId,
     pub name: Option<String>,
@@ -273,7 +273,7 @@ pub struct RunSteps {
 /// here: §5.1 keeps the socket control-plane only and has `cued logs` read
 /// the per-attempt file directly — they're the user's own files, and it
 /// makes `-f` a plain tail instead of a streaming protocol.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogAttempt {
     pub step: StepId,
     pub attempt: u32,
@@ -293,11 +293,16 @@ pub struct LogAttempt {
     pub timed_out: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEntry {
     pub id: RunId,
     pub status: RunStatus,
+    /// When its first step began; `None` until then.
+    pub started_at: Option<Timestamp>,
     pub ended_at: Option<Timestamp>,
+    /// The step a live run is at: executing, waiting to, or held at it.
+    /// `None` once the run is over.
+    pub step: Option<StepId>,
     /// §3.2: `deadline` | `max_visits` | … — why it failed, when the answer
     /// isn't "the command did". Without this the store records a reason
     /// nothing ever shows.

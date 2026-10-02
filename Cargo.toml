@@ -37,3 +37,9 @@ test-hooks = []
 
 [dev-dependencies]
 tempfile = "3"
+
+# The desktop status window lives beside the CLI so it shares the protocol
+# types. Its graphics stack stays in its own crate: `cargo build` here builds
+# only `cued`, and the static release build never compiles eframe.
+[workspace]
+members = [".", "crates/cued-gui"]

@@ -78,7 +78,7 @@ Any directory on your `PATH` works in place of `~/.local/bin`.
 If you have Rust, build and install from source:
 
 ```sh
-cargo install --git https://github.com/RagingRedRiot/cued --locked
+cargo install --git https://github.com/RagingRedRiot/cued --locked cued
 cued setup      # first install; `cued upgrade` when updating
 ```
 
@@ -119,6 +119,23 @@ on), so scripts and agents can act on it. A run held after an interruption
 can be inspected, then resumed with `cued continue` or rerun with `cued retry`.
 The [CLI guide](docs/cli.md) covers waiting, pausing, recovery, and exports;
 `cued --help` has every option.
+
+## Status window
+
+`cued-gui` is a desktop window for your runs, like a CI status page: what is
+running and at which step, what is up next, what needs attention, and how
+recent runs ended, with each step's exit code, timing, and output. It follows
+the daemon's change stream, so it does nothing while nothing changes.
+
+```sh
+cargo install --git https://github.com/RagingRedRiot/cued --locked cued-gui
+cued-gui
+```
+
+It starts the daemon if none is running, from the `cued` beside it or on your
+`PATH` (`--no-auto-start` to leave it stopped). It needs a Wayland or X11
+desktop with OpenGL, and Rust 1.95 or later to build; it is not yet part of
+the release downloads.
 
 ## MCP
 

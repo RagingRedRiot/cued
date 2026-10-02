@@ -169,7 +169,10 @@ pub struct RunOverview {
     pub id: RunId,
     pub status: RunStatus,
     pub scheduled_for: Timestamp,
+    pub started_at: Option<Timestamp>,
     pub ended_at: Option<Timestamp>,
+    /// The cursor's step while the run is live (not `done`).
+    pub step: Option<StepId>,
     /// The frozen wait target while the cursor is Waiting.
     pub cursor_at: Option<Timestamp>,
     pub fail_reason: Option<String>,
@@ -2243,7 +2246,8 @@ impl Store {
             .map(from_ts)
             .transpose()?;
 
-        const COLUMNS: &str = "id, status, ended_at, fail_reason, cursor_kind, cursor_at";
+        const COLUMNS: &str = "id, status, started_at, ended_at, fail_reason, cursor_kind, \
+             cursor_at, CASE WHEN cursor_kind != 'done' THEN cursor_step END AS live_step";
         let run = match query {
             RunQuery::Latest => {
                 sqlx::query(&format!(
@@ -2287,10 +2291,15 @@ impl Store {
                 Some(RunEntry {
                     id: RunId(row.get("id")),
                     status: run_status(row.get("status"))?,
+                    started_at: row
+                        .get::<Option<&str>, _>("started_at")
+                        .map(from_ts)
+                        .transpose()?,
                     ended_at: row
                         .get::<Option<&str>, _>("ended_at")
                         .map(from_ts)
                         .transpose()?,
+                    step: row.get("live_step"),
                     fail_reason: row.get("fail_reason"),
                 })
             }
@@ -2321,8 +2330,9 @@ impl Store {
     pub async fn list_overview(&self, all: bool, now: &Timestamp) -> Result<Vec<JobOverview>> {
         let rows = sqlx::query(
             "SELECT j.id AS job_id, j.name, j.status AS job_status, j.graph, j.next_fire_at, j.approval, j.source, j.expired_at, j.expiry_reason,
-                    r.id AS run_id, r.status AS run_status, r.scheduled_for, r.ended_at,
-                    r.cursor_at, r.fail_reason
+                    r.id AS run_id, r.status AS run_status, r.scheduled_for, r.started_at, r.ended_at,
+                    r.cursor_at, r.fail_reason,
+                    CASE WHEN r.cursor_kind != 'done' THEN r.cursor_step END AS live_step
              FROM jobs j
              LEFT JOIN runs r
                ON r.job_id = j.id
@@ -2340,10 +2350,15 @@ impl Store {
                     id: RunId(run_id),
                     status: run_status(row.get("run_status"))?,
                     scheduled_for: from_ts(row.get("scheduled_for"))?,
+                    started_at: row
+                        .get::<Option<&str>, _>("started_at")
+                        .map(from_ts)
+                        .transpose()?,
                     ended_at: row
                         .get::<Option<&str>, _>("ended_at")
                         .map(from_ts)
                         .transpose()?,
+                    step: row.get("live_step"),
                     cursor_at: row
                         .get::<Option<&str>, _>("cursor_at")
                         .map(from_ts)
@@ -2734,6 +2749,11 @@ mod tests {
             .expect("claimed");
         assert_eq!(attempt, 1);
         assert!(store.waiting_runs().await?.is_empty());
+        // The list shows where a live run is, and since when.
+        let listed = store.list_overview(false, &now).await?;
+        let live = listed[0].last_run.as_ref().unwrap();
+        assert_eq!(live.step.as_deref(), Some("run"));
+        assert_eq!(live.started_at, Some(now));
         // The CAS guard: a duplicate heap entry can't double-claim.
         assert!(store.begin_step(job, run, "run", &now).await?.is_none());
 
@@ -2763,6 +2783,8 @@ mod tests {
         let last = jobs[0].last_run.as_ref().unwrap();
         assert_eq!(last.status, RunStatus::Done);
         assert!(last.ended_at.is_some());
+        assert_eq!(last.step, None, "an ended run is at no step");
+        assert_eq!(last.started_at, Some(now));
         Ok(())
     }
 

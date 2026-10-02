@@ -370,7 +370,18 @@ Expired jobs without runs age from their durable expiry timestamp.
 
 CLI list, show, logs, and JSON output support inspection. Run and attempt records
 retain outcome and timing information. MCP exports a restricted projection of
-that state; bounded log tails report truncation.
+that state; bounded log tails report truncation. A list entry's latest run
+carries when it started and, while it is live, the step it is at.
+
+`cued-gui` is a desktop status window over the same requests, in its own crate
+so the CLI and daemon never build its graphics stack. It is a client like the
+CLI: it holds a §5.1 subscription and refetches the list and the selected
+job's latest run on each notice, reading a step's log file directly, as `cued
+logs` does. While nothing changes it makes no requests and does not redraw;
+the only timers are a running step's log, re-read each second while it is on
+screen, and elapsed times counting up while a run is shown. It starts a daemon
+when none is running as the window opens, from a `cued` binary it locates, and
+never afterwards: a daemon stopped on purpose stays stopped.
 
 `cued wait` (and `--wait` on `at`, `chain`, and `submit`) blocks until a run
 settles, meaning done, failed, held, cancelled, or missed, and exits with a

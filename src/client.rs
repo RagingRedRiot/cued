@@ -719,14 +719,18 @@ fn connect_or_spawn(paths: &Paths) -> Result<UnixStream> {
     if let Ok(stream) = UnixStream::connect(&paths.socket_file) {
         return Ok(stream);
     }
-
-    // §5.2 auto-spawn, the gpg-agent model: start it detached and retry
-    // briefly. The warning is about being *unsupervised*, so it's only worth
-    // printing when §8 says nothing is: with a backend installed, the daemon
-    // being down is a transient the backend will handle, and nagging about
-    // it every time would train the user to ignore the line that matters.
-    let supervised = persist::any_installed();
     let exe = std::env::current_exe().context("locating the cued binary")?;
+    spawn_and_connect(paths, &exe)
+}
+
+/// §5.2 auto-spawn from `exe`, then connect.
+fn spawn_and_connect(paths: &Paths, exe: &Path) -> Result<UnixStream> {
+    // The gpg-agent model: start it detached and retry briefly. The warning
+    // is about being *unsupervised*, so it's only worth printing when §8
+    // says nothing is: with a backend installed, the daemon being down is a
+    // transient the backend will handle, and nagging about it every time
+    // would train the user to ignore the line that matters.
+    let supervised = persist::any_installed();
     let mut daemon = std::process::Command::new(exe);
     daemon
         .arg("daemon")
@@ -758,6 +762,129 @@ fn connect_or_spawn(paths: &Paths) -> Result<UnixStream> {
         paths.socket_file.display(),
         paths.daemon_log.display()
     )
+}
+
+// ---------------------------------------------------------------------------
+// Other front-ends (cued-gui): the same socket, framing, and auto-spawn
+// ---------------------------------------------------------------------------
+
+/// How long one front-end exchange may take, connect to reply.
+pub const CALL_LIMIT: Duration = Duration::from_secs(10);
+
+/// Why a front-end's request failed.
+#[derive(Debug)]
+pub enum CallError {
+    /// Nothing is listening: no daemon is running.
+    NoDaemon,
+    /// The daemon answered with an error, or the exchange broke.
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDaemon => f.write_str("the cued daemon is not running"),
+            Self::Failed(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for CallError {}
+
+/// One request and its reply within [`CALL_LIMIT`], never starting a
+/// daemon. An `Error` or `ProtoMismatch` reply is returned as `Failed`, so
+/// `Ok` is always a reply to the request.
+pub fn call(paths: &Paths, body: RequestBody) -> std::result::Result<Response, CallError> {
+    let until = std::time::Instant::now() + CALL_LIMIT;
+    let line =
+        exchange_until(&paths.socket_file, body, until).map_err(|failure| match failure {
+            Exchange::NoDaemon => CallError::NoDaemon,
+            Exchange::OutOfTime | Exchange::QueueFull | Exchange::NoReply => CallError::Failed(
+                anyhow::anyhow!("the daemon didn't answer within {}s", CALL_LIMIT.as_secs()),
+            ),
+            Exchange::Broken(error) | Exchange::Unusable(error) => CallError::Failed(error),
+        })?;
+    let response = decode_reply(&line)
+        .and_then(advise_on_rejection)
+        .map_err(CallError::Failed)?;
+    match response {
+        Response::Error { .. } | Response::ProtoMismatch { .. } => {
+            Err(CallError::Failed(fail_on::<()>(response).unwrap_err()))
+        }
+        response => Ok(response),
+    }
+}
+
+/// The reply a caller didn't expect, as an error.
+pub fn unexpected(response: Response) -> anyhow::Error {
+    anyhow::anyhow!("unexpected daemon reply: {response:?}")
+}
+
+/// Start a daemon from `exe` (a `cued` binary, not the caller's own) and
+/// wait briefly for it to listen. A daemon already running is left alone:
+/// the new one loses the data lock and exits.
+pub fn start_daemon(paths: &Paths, exe: &Path) -> Result<()> {
+    spawn_and_connect(paths, exe).map(drop)
+}
+
+/// A §5.1 change stream. Blocks in [`Subscription::changed`] with no timeout
+/// and no polling: an idle daemon sends nothing, and one that stops closes
+/// the socket.
+pub struct Subscription {
+    reader: std::io::BufReader<UnixStream>,
+}
+
+impl Subscription {
+    /// Subscribe, never starting a daemon. Fetch what is shown once this
+    /// returns: any change from then on is told.
+    pub fn open(paths: &Paths) -> std::result::Result<Self, CallError> {
+        let until = std::time::Instant::now() + CALL_LIMIT;
+        let stream = connect_within(&paths.socket_file, CALL_LIMIT).map_err(|error| {
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT | libc::ECONNREFUSED)
+            ) {
+                CallError::NoDaemon
+            } else {
+                CallError::Failed(error.into())
+            }
+        })?;
+        let failed = |error: anyhow::Error| CallError::Failed(error);
+        write_request(&stream, RequestBody::Subscribe, Some(until))
+            .context("writing to daemon")
+            .map_err(failed)?;
+        let line = read_reply_line(&stream, Some(until))
+            .context("reading daemon reply")
+            .map_err(failed)?;
+        match decode_reply(&line)
+            .and_then(advise_on_rejection)
+            .map_err(failed)?
+        {
+            Response::Subscribed => {}
+            other => return Err(failed(fail_on::<()>(other).unwrap_err())),
+        }
+        stream
+            .set_read_timeout(None)
+            .context("clearing the read timeout")
+            .map_err(failed)?;
+        Ok(Self {
+            reader: std::io::BufReader::new(stream),
+        })
+    }
+
+    /// Block until something changes (`Ok(true)`) or the daemon closes the
+    /// stream (`Ok(false)`), as it does on stopping or upgrading.
+    pub fn changed(&mut self) -> Result<bool> {
+        use std::io::BufRead;
+        let mut line = String::new();
+        if self.reader.read_line(&mut line)? == 0 {
+            return Ok(false);
+        }
+        match decode_reply(&line)? {
+            Response::Changed => Ok(true),
+            other => Err(unexpected(other)),
+        }
+    }
 }
 
 /// Terminal handling for every reply that isn't the one the caller wanted.

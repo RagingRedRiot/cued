@@ -2964,7 +2964,9 @@ async fn handle_list(ctx: &Ctx, all: bool) -> Result<Vec<JobEntry>> {
             last_run: overview.last_run.map(|run| RunEntry {
                 id: run.id,
                 status: run.status,
+                started_at: run.started_at,
                 ended_at: run.ended_at,
+                step: run.step,
                 fail_reason: run.fail_reason,
             }),
         })

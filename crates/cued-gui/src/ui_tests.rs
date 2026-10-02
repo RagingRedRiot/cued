@@ -1,0 +1,225 @@
+//! Interaction tests: drive the real window code through egui's
+//! accessibility tree, with the backend's two ends held by the test.
+use crate::app::App;
+use crate::backend::{Backend, Command, Detail, Link, Log, Update};
+use cued::model::{JobId, JobSource, JobStatus, RunId, RunStatus};
+use cued::proto::{JobEntry, LogAttempt, RunEntry};
+use egui_kittest::{Harness, kittest::Queryable};
+use jiff::{SignedDuration, Timestamp};
+use std::sync::mpsc::{Receiver, Sender};
+
+struct Ui {
+    harness: Harness<'static, App>,
+    updates: Sender<Update>,
+    commands: Receiver<Command>,
+}
+
+impl Ui {
+    fn new() -> Self {
+        let (backend, updates, commands) = Backend::detached();
+        let harness = Harness::builder()
+            .with_size([1100.0, 700.0])
+            .build_ui_state(|ui, app: &mut App| app.show(ui), App::new(backend));
+        let mut ui = Self {
+            harness,
+            updates,
+            commands,
+        };
+        ui.settle();
+        ui
+    }
+
+    fn settle(&mut self) {
+        for _ in 0..4 {
+            self.harness.step();
+        }
+    }
+
+    fn send(&mut self, update: Update) {
+        self.updates.send(update).unwrap();
+        self.settle();
+    }
+
+    fn command(&self) -> Command {
+        self.commands
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a command")
+    }
+}
+
+fn ago(seconds: i64) -> Timestamp {
+    Timestamp::now()
+        .checked_sub(SignedDuration::from_secs(seconds))
+        .unwrap()
+}
+
+fn job(id: i64, name: &str, status: JobStatus, run: Option<RunEntry>) -> JobEntry {
+    JobEntry {
+        id: JobId(id),
+        name: Some(name.into()),
+        status,
+        approval: None,
+        source: JobSource::Cli,
+        expired_at: None,
+        expiry_reason: None,
+        action: format!("./{name}.sh"),
+        next_at: None,
+        last_run: run,
+    }
+}
+
+fn run(status: RunStatus, step: Option<&str>, ended: bool) -> RunEntry {
+    RunEntry {
+        id: RunId(1),
+        status,
+        started_at: Some(ago(90)),
+        ended_at: ended.then(|| ago(30)),
+        step: step.map(String::from),
+        fail_reason: None,
+    }
+}
+
+fn jobs() -> Vec<JobEntry> {
+    vec![
+        job(
+            1,
+            "pipeline",
+            JobStatus::Active,
+            Some(run(RunStatus::Running, Some("test"), false)),
+        ),
+        job(
+            2,
+            "deploy",
+            JobStatus::Active,
+            Some(run(RunStatus::Held, Some("ship"), false)),
+        ),
+        job(
+            3,
+            "backup",
+            JobStatus::Done,
+            Some(run(RunStatus::Done, None, true)),
+        ),
+    ]
+}
+
+fn attempt(step: &str, exit_code: Option<i32>, running: bool) -> LogAttempt {
+    LogAttempt {
+        step: step.into(),
+        attempt: 1,
+        started_at: ago(60),
+        ended_at: (!running).then(|| ago(40)),
+        running,
+        exit_code,
+        timed_out: false,
+    }
+}
+
+fn log(step: &str, text: &str) -> Log {
+    Log {
+        step: step.into(),
+        attempt: 1,
+        text: text.into(),
+        truncated: false,
+    }
+}
+
+#[test]
+fn jobs_are_grouped_by_where_they_stand() {
+    let mut ui = Ui::new();
+    ui.harness.get_by_label("Connecting…");
+    ui.send(Update::Link(Link::Live));
+    ui.send(Update::Jobs(Ok(jobs())));
+
+    ui.harness.get_by_label("Live");
+    ui.harness.get_by_label("NEEDS ATTENTION 1");
+    ui.harness.get_by_label("RUNNING 1");
+    ui.harness.get_by_label("RECENT 1");
+    assert!(ui.harness.query_by_label("UP NEXT 0").is_none());
+    ui.harness.get_by_label("j1 pipeline, running, Running");
+    ui.harness.get_by_label("j2 deploy, held, Needs attention");
+    ui.harness.get_by_label("j3 backup, done, Recent");
+    ui.harness.get_by_label("Select a job to see its steps.");
+}
+
+#[test]
+fn selecting_a_job_shows_its_steps_and_the_running_log() {
+    let mut ui = Ui::new();
+    ui.send(Update::Link(Link::Live));
+    ui.send(Update::Jobs(Ok(jobs())));
+
+    ui.harness
+        .get_by_label("j1 pipeline, running, Running")
+        .click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::Select(Some(JobId(1))));
+    ui.harness.get_by_label("Loading…");
+
+    ui.send(Update::Detail(Some(Ok(Detail {
+        job: JobId(1),
+        run: Some(RunId(1)),
+        attempts: vec![
+            attempt("build", Some(0), false),
+            attempt("test", None, true),
+        ],
+        log: Some(log("test", "running tests\n")),
+    }))));
+    ui.harness.get_by_label_contains("build, exit 0, 20s");
+    ui.harness.get_by_label_contains("test, running, 1m");
+    ui.harness.get_by_label("OUTPUT · TEST");
+    ui.harness.get_by_label("running tests\n");
+
+    // The followed log grows without a new manifest.
+    ui.send(Update::Log {
+        job: JobId(1),
+        run: RunId(1),
+        log: log("test", "running tests\nall passed\n"),
+    });
+    ui.harness.get_by_label("running tests\nall passed\n");
+
+    // Picking another attempt asks for its log.
+    ui.harness.get_by_label_contains("build, exit 0").click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::ShowLog(Some(("build".into(), 1))));
+}
+
+#[test]
+fn a_detail_for_a_job_no_longer_selected_is_ignored() {
+    let mut ui = Ui::new();
+    ui.send(Update::Link(Link::Live));
+    ui.send(Update::Jobs(Ok(jobs())));
+    ui.harness.get_by_label("j3 backup, done, Recent").click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::Select(Some(JobId(3))));
+
+    // A slow fetch for an earlier selection lands after the new one.
+    ui.send(Update::Detail(Some(Ok(Detail {
+        job: JobId(1),
+        run: Some(RunId(1)),
+        attempts: vec![attempt("build", Some(0), false)],
+        log: None,
+    }))));
+    assert!(
+        ui.harness
+            .query_by_label_contains("build, exit 0")
+            .is_none()
+    );
+    ui.harness.get_by_label("Loading…");
+}
+
+#[test]
+fn no_daemon_offers_to_start_one() {
+    let mut ui = Ui::new();
+    ui.send(Update::Link(Link::NoDaemon));
+    ui.harness.get_by_label("Daemon not running");
+    ui.harness.get_by_label("Start daemon").click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::StartDaemon);
+}
+
+#[test]
+fn an_empty_list_says_how_to_schedule_something() {
+    let mut ui = Ui::new();
+    ui.send(Update::Link(Link::Live));
+    ui.send(Update::Jobs(Ok(Vec::new())));
+    ui.harness.get_by_label("Nothing scheduled.");
+}
