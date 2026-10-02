@@ -2,6 +2,7 @@
 name = "cued"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 description = "Durable per-user scheduling of one-off and recurring commands, reminders, and multi-step workflows"
 license = "MIT"
 
