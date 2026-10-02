@@ -238,7 +238,10 @@ pub fn job_summary(job: &JobEntry, now: Timestamp) -> String {
             }
         }
         Section::UpNext => {
+            // A paused job keeps its last arming, which goes stale; it fires
+            // nothing until resumed, so say that instead.
             let next = match job.next_at {
+                _ if job.status == JobStatus::Paused => "paused · resume to schedule".into(),
                 Some(at) => format!("next {}", relative(at, now)),
                 None => "not armed".into(),
             };
@@ -309,19 +312,9 @@ pub enum Verb {
 }
 
 impl Verb {
-    pub fn label(self) -> &'static str {
-        match self {
-            Verb::Continue => "Continue",
-            Verb::Retry => "Retry",
-            Verb::Pause => "Pause",
-            Verb::Resume => "Resume",
-            Verb::Cancel => "Cancel",
-        }
-    }
-
     pub fn hint(self) -> &'static str {
         match self {
-            Verb::Continue => "Resume the held run from the step it stopped at",
+            Verb::Continue => "Pick the held run up at the step it stopped at",
             Verb::Retry => "Run the latest run again, from the held step or the start",
             Verb::Pause => "Start no new work; a step already running finishes",
             Verb::Resume => "Let the job start work again",
@@ -330,29 +323,77 @@ impl Verb {
     }
 }
 
-/// The verbs that apply to a job as it stands, in button order. The daemon
-/// has the last word; this only keeps buttons that can't work off screen.
-pub fn verbs(job: &JobEntry) -> Vec<Verb> {
-    let mut verbs = Vec::new();
+/// Which a button acts on: the job's latest run, or the job itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Run,
+    Job,
+}
+
+/// One control button as the window shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Control {
+    pub verb: Verb,
+    /// Says what it acts on: "Continue from “ship”", "Pause job".
+    pub label: String,
+    pub scope: Scope,
+    /// Shown dimmed and unclickable, for this reason.
+    pub disabled: Option<&'static str>,
+}
+
+impl Control {
+    fn new(verb: Verb, label: impl Into<String>, scope: Scope) -> Self {
+        Self {
+            verb,
+            label: label.into(),
+            scope,
+            disabled: None,
+        }
+    }
+}
+
+/// The controls for a job as it stands: the run's first, then the job's.
+/// Only those that could apply are listed; Pause stays listed on a paused
+/// job or a held run, dimmed, so the job's controls keep their place. The
+/// daemon has the last word.
+pub fn controls(job: &JobEntry) -> Vec<Control> {
+    let mut controls = Vec::new();
     let approved = !awaiting_approval(job) && job.status != JobStatus::Expired;
+    let held = run_status(job) == Some(RunStatus::Held);
     match run_status(job) {
-        Some(RunStatus::Held) if approved => verbs.extend([Verb::Continue, Verb::Retry]),
+        Some(RunStatus::Held) if approved => {
+            let label = match job.last_run.as_ref().and_then(|run| run.step.as_deref()) {
+                Some(step) => format!("Continue from “{step}”"),
+                None => "Continue run".into(),
+            };
+            controls.push(Control::new(Verb::Continue, label, Scope::Run));
+            controls.push(Control::new(Verb::Retry, "Retry run", Scope::Run));
+        }
         Some(RunStatus::Done | RunStatus::Failed | RunStatus::Missed | RunStatus::Cancelled)
             if approved =>
         {
-            verbs.push(Verb::Retry)
+            controls.push(Control::new(Verb::Retry, "Retry run", Scope::Run));
         }
         _ => {}
     }
-    match job.status {
-        JobStatus::Active if !awaiting_approval(job) => verbs.push(Verb::Pause),
-        JobStatus::Paused if !awaiting_approval(job) => verbs.push(Verb::Resume),
-        _ => {}
+    if job.status.is_live() && !awaiting_approval(job) {
+        let mut pause = Control::new(Verb::Pause, "Pause job", Scope::Job);
+        pause.disabled = if job.status == JobStatus::Paused {
+            Some("Already paused")
+        } else if held {
+            Some("Nothing new starts while the run is held: continue or retry it")
+        } else {
+            None
+        };
+        controls.push(pause);
+        if job.status == JobStatus::Paused {
+            controls.push(Control::new(Verb::Resume, "Resume job", Scope::Job));
+        }
     }
     if job.status.is_live() {
-        verbs.push(Verb::Cancel);
+        controls.push(Control::new(Verb::Cancel, "Cancel job", Scope::Job));
     }
-    verbs
+    controls
 }
 
 /// One row of a run's plan: the steps it ran, in order, then the steps it
@@ -551,6 +592,13 @@ mod tests {
         assert_eq!(job_mark(&between).label, "waiting");
         assert_eq!(job_mark(&recurring).label, "scheduled");
         assert_eq!(job_summary(&recurring, at(0)), "next in 1m · last done");
+        // Paused, its arming goes stale: it says paused, not "next 5m ago".
+        let mut paused = recurring.clone();
+        paused.status = JobStatus::Paused;
+        assert_eq!(
+            job_summary(&paused, at(360)),
+            "paused · resume to schedule · last done"
+        );
         assert_eq!(
             job_summary(&held, at(0)),
             "held at deploy · cued continue or retry"
@@ -558,27 +606,55 @@ mod tests {
     }
 
     #[test]
-    fn verbs_follow_the_job_and_its_run() {
-        use Verb::*;
-        let held = job(1, JobStatus::Active, Some(run(RunStatus::Held)));
-        assert_eq!(verbs(&held), [Continue, Retry, Pause, Cancel]);
+    fn controls_follow_the_job_and_its_run() {
+        // Each control as "label", dimmed ones as "(label)".
+        let read = |job: &JobEntry| -> Vec<String> {
+            controls(job)
+                .into_iter()
+                .map(|c| match c.disabled {
+                    Some(_) => format!("({})", c.label),
+                    None => c.label,
+                })
+                .collect()
+        };
+        let mut held = job(1, JobStatus::Active, Some(run(RunStatus::Held)));
+        held.last_run.as_mut().unwrap().step = Some("ship".into());
+        assert_eq!(
+            read(&held),
+            [
+                "Continue from “ship”",
+                "Retry run",
+                "(Pause job)",
+                "Cancel job"
+            ]
+        );
         let running = job(2, JobStatus::Active, Some(run(RunStatus::Running)));
-        assert_eq!(verbs(&running), [Pause, Cancel]);
+        assert_eq!(read(&running), ["Pause job", "Cancel job"]);
         let paused = job(3, JobStatus::Paused, Some(run(RunStatus::Done)));
-        assert_eq!(verbs(&paused), [Retry, Resume, Cancel]);
+        assert_eq!(
+            read(&paused),
+            ["Retry run", "(Pause job)", "Resume job", "Cancel job"]
+        );
         let failed = job(4, JobStatus::Done, Some(run(RunStatus::Failed)));
-        assert_eq!(verbs(&failed), [Retry]);
+        assert_eq!(read(&failed), ["Retry run"]);
         let expired = job(5, JobStatus::Expired, None);
-        assert_eq!(verbs(&expired), []);
+        assert!(read(&expired).is_empty());
         let mut pending = job(6, JobStatus::Active, None);
         pending.approval = Some(Approval {
             state: ApprovalState::Pending,
             definition_hash: [0; 32],
             approved_at: None,
         });
-        assert_eq!(verbs(&pending), [Cancel], "approval stays at the terminal");
+        assert_eq!(
+            read(&pending),
+            ["Cancel job"],
+            "approval stays at the terminal"
+        );
         let skipped = job(7, JobStatus::Done, Some(run(RunStatus::Skipped)));
-        assert_eq!(verbs(&skipped), []);
+        assert!(read(&skipped).is_empty());
+
+        let scopes: Vec<Scope> = controls(&held).iter().map(|c| c.scope).collect();
+        assert_eq!(scopes, [Scope::Run, Scope::Run, Scope::Job, Scope::Job]);
     }
 
     /// ship-it from the demo: a flaky test that loops through clear-cache,

@@ -5,9 +5,9 @@
 //! only while a run on screen is counting up.
 use crate::backend::{Backend, Command, Detail, Link, Update};
 use crate::flow;
-use crate::model::{self, Mark, PlanRow, Section, Tone, Verb};
+use crate::model::{self, Mark, PlanRow, Scope, Section, Tone, Verb};
 use crate::theme::{self, Palette, icon};
-use cued::model::JobId;
+use cued::model::{JobId, JobStatus, RunStatus};
 use cued::proto::JobEntry;
 use eframe::egui::{self, Color32, CornerRadius, RichText};
 use jiff::Timestamp;
@@ -220,7 +220,7 @@ impl App {
                 ui.horizontal(|ui| {
                     confirmed = ui
                         .add(egui::Button::new(
-                            RichText::new("Cancel job").color(p.danger),
+                            RichText::new("Yes, cancel it").color(p.danger),
                         ))
                         .clicked();
                     kept = ui.button("Keep it").clicked();
@@ -567,10 +567,12 @@ fn job_row(
     response
 }
 
-/// The job's control buttons; the one clicked, if any.
+/// The control buttons: the run's first, set off as what needs doing, then
+/// the job's. A control that can't apply now is dimmed, its reason on hover.
+/// Returns the one clicked, if any.
 fn controls(ui: &mut egui::Ui, job: &JobEntry, busy: bool) -> Option<Verb> {
-    let verbs = model::verbs(job);
-    if verbs.is_empty() {
+    let controls = model::controls(job);
+    if controls.is_empty() {
         return None;
     }
     let p = Palette::of(ui.visuals());
@@ -578,16 +580,30 @@ fn controls(ui: &mut egui::Ui, job: &JobEntry, busy: bool) -> Option<Verb> {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_enabled_ui(!busy, |ui| {
-            for verb in verbs {
-                let text = RichText::new(verb.label());
-                let text = if verb == Verb::Cancel {
-                    text.color(p.danger)
-                } else {
-                    text
+            let mut previous = None;
+            for control in controls {
+                if previous == Some(Scope::Run) && control.scope == Scope::Job {
+                    ui.add_space(14.0);
+                }
+                previous = Some(control.scope);
+                let text = RichText::new(&control.label);
+                let button = match (control.scope, control.verb) {
+                    (Scope::Run, _) => egui::Button::new(text.color(p.accent_text))
+                        .fill(p.accent_soft)
+                        .stroke(egui::Stroke::new(1.0, p.accent)),
+                    (_, Verb::Cancel) => egui::Button::new(text.color(p.danger))
+                        .stroke(egui::Stroke::new(1.0, p.hairline)),
+                    _ => egui::Button::new(text).stroke(egui::Stroke::new(1.0, p.hairline)),
                 };
-                let button = egui::Button::new(text).stroke(egui::Stroke::new(1.0, p.hairline));
-                if ui.add(button).on_hover_text(verb.hint()).clicked() {
-                    clicked = Some(verb);
+                let response = ui
+                    .add_enabled(control.disabled.is_none(), button)
+                    .on_hover_text(control.verb.hint());
+                let response = match control.disabled {
+                    Some(why) => response.on_disabled_hover_text(why),
+                    None => response,
+                };
+                if response.clicked() {
+                    clicked = Some(control.verb);
                 }
             }
         });
@@ -610,18 +626,24 @@ fn header(ui: &mut egui::Ui, job: &JobEntry, now: Timestamp) {
         facts.push(format!("run {}", run.id));
         if let Some(start) = run.started_at {
             facts.push(format!("started {}", model::relative(start, now)));
-            let verb = if run.ended_at.is_some() {
-                "took"
-            } else {
-                "running for"
+            // A held run has no end, but isn't running either: its start
+            // says enough.
+            let verb = match (run.ended_at, run.status) {
+                (Some(_), _) => Some("took"),
+                (None, RunStatus::Running | RunStatus::Waiting) => Some("running for"),
+                (None, _) => None,
             };
-            facts.push(format!(
-                "{verb} {}",
-                model::elapsed(start, run.ended_at, now)
-            ));
+            if let Some(verb) = verb {
+                facts.push(format!(
+                    "{verb} {}",
+                    model::elapsed(start, run.ended_at, now)
+                ));
+            }
         }
     }
-    if let Some(next) = job.next_at {
+    if job.status == JobStatus::Paused {
+        facts.push("paused".into());
+    } else if let Some(next) = job.next_at {
         facts.push(format!("next {}", model::relative(next, now)));
     }
     if !facts.is_empty() {

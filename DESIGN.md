@@ -409,8 +409,14 @@ its allowed visits. Each attempt's `epoch` comes with it, so a run rewound by
 where a run ended.
 
 The window offers continue, retry, pause, resume, and cancel, sending the same
-requests as the CLI verbs; cancel asks first. It shows only the verbs that can
-apply to the job as listed, and reports the daemon's refusal when one doesn't.
+requests as the CLI verbs; cancel asks first. Each button names what it acts
+on, and the run's come first: continue and retry act on the latest run ("Continue
+from ship", "Retry run"), pause, resume, and cancel on the job ("Pause job"). A
+held run's buttons are set off as what needs doing. Pause stays in place but is
+dimmed, its reason on hover, when the job is already paused or its run is held,
+since nothing new starts then anyway. Otherwise only the verbs that can apply
+to the job as listed are shown, and the daemon's refusal is reported when one
+doesn't.
 It has no approve button: approval binds a definition a person has reviewed
 (§7.6), which stays a terminal review of the exact text. `cued-gui
 --install-desktop` writes a freedesktop launcher entry and icons under

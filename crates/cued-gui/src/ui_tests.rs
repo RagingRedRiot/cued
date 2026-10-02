@@ -243,16 +243,28 @@ fn select_held(ui: &mut Ui) {
 fn controls_act_on_the_selected_job_and_report_back() {
     let mut ui = Ui::new();
     select_held(&mut ui);
-    for label in ["Continue", "Retry", "Pause", "Cancel"] {
+    for label in [
+        "Continue from “ship”",
+        "Retry run",
+        "Pause job",
+        "Cancel job",
+    ] {
         ui.harness.get_by_label(label);
     }
-    assert!(ui.harness.query_by_label("Resume").is_none());
+    assert!(ui.harness.query_by_label("Resume job").is_none());
+    // A held run: nothing new starts anyway, so Pause is shown but dimmed.
+    ui.harness.get_by_label("Pause job").click();
+    ui.settle();
+    assert!(
+        ui.commands.try_recv().is_err(),
+        "a dimmed Pause was clickable"
+    );
 
-    ui.harness.get_by_label("Continue").click();
+    ui.harness.get_by_label("Continue from “ship”").click();
     ui.settle();
     assert_eq!(ui.command(), Command::Act(JobId(2), Verb::Continue));
     // No second request while the first is unanswered.
-    ui.harness.get_by_label("Retry").click();
+    ui.harness.get_by_label("Retry run").click();
     ui.settle();
     assert!(
         ui.commands.try_recv().is_err(),
@@ -269,7 +281,7 @@ fn controls_act_on_the_selected_job_and_report_back() {
             .is_none()
     );
 
-    ui.harness.get_by_label("Retry").click();
+    ui.harness.get_by_label("Retry run").click();
     ui.settle();
     assert_eq!(ui.command(), Command::Act(JobId(2), Verb::Retry));
     ui.send(Update::Acted(Err("j2.r1 is still live".into())));
@@ -277,11 +289,33 @@ fn controls_act_on_the_selected_job_and_report_back() {
 }
 
 #[test]
+fn a_paused_job_dims_pause_and_offers_resume() {
+    let mut ui = Ui::new();
+    ui.send(Update::Link(Link::Live));
+    let mut jobs = jobs();
+    jobs[2].status = JobStatus::Paused;
+    ui.send(Update::Jobs(Ok(jobs)));
+    ui.harness.get_by_label_contains("j3 backup, ").click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::Select(Some(JobId(3))));
+
+    ui.harness.get_by_label("Pause job").click();
+    ui.settle();
+    assert!(
+        ui.commands.try_recv().is_err(),
+        "Pause stayed clickable while paused"
+    );
+    ui.harness.get_by_label("Resume job").click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::Act(JobId(3), Verb::Resume));
+}
+
+#[test]
 fn cancel_asks_first() {
     let mut ui = Ui::new();
     select_held(&mut ui);
 
-    ui.harness.get_by_label("Cancel").click();
+    ui.harness.get_by_label("Cancel job").click();
     ui.settle();
     ui.harness.get_by_label("Cancel j2 deploy?");
     ui.harness.get_by_label("Keep it").click();
@@ -292,11 +326,53 @@ fn cancel_asks_first() {
         "kept, yet something was sent"
     );
 
-    ui.harness.get_by_label("Cancel").click();
-    ui.settle();
     ui.harness.get_by_label("Cancel job").click();
     ui.settle();
+    ui.harness.get_by_label("Yes, cancel it").click();
+    ui.settle();
     assert_eq!(ui.command(), Command::Act(JobId(2), Verb::Cancel));
+}
+
+#[test]
+fn the_graph_view_draws_each_step_as_a_box_and_a_click_shows_its_output() {
+    let mut ui = Ui::new();
+    ui.send(Update::Link(Link::Live));
+    ui.send(Update::Jobs(Ok(jobs())));
+    ui.harness.get_by_label("j3 backup, done, Recent").click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::Select(Some(JobId(3))));
+    let graph = cued::submit::chain_graph(
+        "./dump.sh",
+        &[cued::submit::Link::Then("./upload.sh".into())],
+        cued::submit::ChainFailure::Stop,
+    )
+    .unwrap();
+    let names: Vec<String> = graph.steps.keys().cloned().collect();
+    let mut first = attempt(&names[0], Some(0), false);
+    first.outcome_edge = Some(0);
+    let second = attempt(&names[1], Some(0), false);
+    ui.send(Update::Detail(Some(Ok(Detail {
+        job: JobId(3),
+        run: Some(RunId(1)),
+        attempts: vec![first, second],
+        log: Some(log(&names[1], "uploaded\n")),
+        graph: Some(graph),
+    }))));
+
+    assert!(
+        ui.harness.query_by_label_contains(" box, ").is_none(),
+        "the list is the default"
+    );
+    ui.harness.get_by_label("Graph").click();
+    ui.settle();
+    ui.harness
+        .get_by_label(&format!("{} box, exit 0 · 20s", names[0]))
+        .click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::ShowLog(Some((names[0].clone(), 1))));
+    ui.harness.get_by_label("List").click();
+    ui.settle();
+    assert!(ui.harness.query_by_label_contains(" box, ").is_none());
 }
 
 #[test]
@@ -343,46 +419,4 @@ fn the_steps_still_to_come_show_after_those_that_ran() {
         "{second}, running, 1m, then succeeded → goto {third}"
     ));
     ui.harness.get_by_label(&format!("{third}, pending"));
-}
-
-#[test]
-fn the_graph_view_draws_each_step_as_a_box_and_a_click_shows_its_output() {
-    let mut ui = Ui::new();
-    ui.send(Update::Link(Link::Live));
-    ui.send(Update::Jobs(Ok(jobs())));
-    ui.harness.get_by_label("j3 backup, done, Recent").click();
-    ui.settle();
-    assert_eq!(ui.command(), Command::Select(Some(JobId(3))));
-    let graph = cued::submit::chain_graph(
-        "./dump.sh",
-        &[cued::submit::Link::Then("./upload.sh".into())],
-        cued::submit::ChainFailure::Stop,
-    )
-    .unwrap();
-    let names: Vec<String> = graph.steps.keys().cloned().collect();
-    let mut first = attempt(&names[0], Some(0), false);
-    first.outcome_edge = Some(0);
-    let second = attempt(&names[1], Some(0), false);
-    ui.send(Update::Detail(Some(Ok(Detail {
-        job: JobId(3),
-        run: Some(RunId(1)),
-        attempts: vec![first, second],
-        log: Some(log(&names[1], "uploaded\n")),
-        graph: Some(graph),
-    }))));
-
-    assert!(
-        ui.harness.query_by_label_contains(" box, ").is_none(),
-        "the list is the default"
-    );
-    ui.harness.get_by_label("Graph").click();
-    ui.settle();
-    ui.harness
-        .get_by_label(&format!("{} box, exit 0 · 20s", names[0]))
-        .click();
-    ui.settle();
-    assert_eq!(ui.command(), Command::ShowLog(Some((names[0].clone(), 1))));
-    ui.harness.get_by_label("List").click();
-    ui.settle();
-    assert!(ui.harness.query_by_label_contains(" box, ").is_none());
 }
