@@ -129,6 +129,32 @@ and daemon must belong to the same user. Protocol version remains 1 for this
 unreleased alpha; incompatible or stale daemon responses produce a restart
 instruction. There is no network listener.
 
+A client that wants to follow changes, such as a status window, sends
+`Subscribe` instead of polling. The daemon replies `Subscribed`, then sends
+`Changed` after each commit that `list`, `show`, or `logs` could see. A notice
+names nothing: the subscriber refetches what it shows, so the read requests
+stay the one source of data. Commits that land close together, or while a
+notice is still being written, arrive as one. Nothing is sent while nothing
+changes, and a subscriber's own refetches change nothing: the expiry and
+exhaustion sweeps those reads run write only when they find something. The
+connection takes no further requests; closing it, or sending another line,
+ends the stream.
+
+Notices come from SQLite's hooks on the single writer connection, not from
+each write path, so a new write cannot forget to send one. A change is told
+once the writer is released, because the commit hook runs before the commit
+completes and a subscriber told from there could read the old state. Rolled
+back changes, and §3.5 delivery bookkeeping that no inspection view reads,
+are not told. A failed commit can produce a notice with nothing behind it,
+which costs a refetch; the design accepts that rather than ever missing one.
+
+An upgrade waits for request handlers to finish (§5.2), but not for a
+subscription, which would never finish.
+The exec closes the stream, and the subscriber reconnects to the new image
+and fetches everything again, as it does after any reconnect: notices are
+not stored, and a subscriber learns of what happened while it was away only
+by refetching.
+
 ### 5.2 Daemon lifecycle
 
 Clients start a daemon on demand. A data-directory lock prevents competing
@@ -244,7 +270,8 @@ a command might produce. MCP cannot request environment overrides or `keep_env`.
 
 The stdio server exposes `schedule`, `list`, `show`, `cancel`, and `logs`.
 Scheduling accepts one action or a workflow graph, a time, and optional recurrence.
-There are no MCP approval, installation, daemon, GC, or recovery tools.
+There are no MCP approval, installation, daemon, GC, recovery, or change
+subscription tools.
 
 `mcp.toml` selects `open`, `approve`, or `closed` independently for exec and notify.
 Both default to closed. Read access defaults to on; logs default to off. Each

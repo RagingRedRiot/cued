@@ -320,6 +320,61 @@ fn nothing_new_installed_is_a_no_op() -> Result<()> {
     Ok(())
 }
 
+/// A change subscriber (§5.1) stays connected indefinitely, so it must not
+/// count as work an upgrade drains: the upgrade goes ahead at once, the
+/// exec ends the stream, and the subscriber picks up on the new image.
+#[test]
+fn a_change_subscriber_does_not_hold_up_an_upgrade() -> Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let install = Install::new()?;
+    install.cued(&["list"])?;
+    let pid = install.daemon_pid().expect("the auto-spawned daemon");
+    let socket = install.home().join("cued.sock");
+    let subscribe = || -> Result<BufReader<UnixStream>> {
+        let mut stream = UnixStream::connect(&socket)?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut line = serde_json::to_string(&cued::proto::Request {
+            proto: cued::proto::PROTO_VERSION,
+            body: cued::proto::RequestBody::Subscribe,
+        })?;
+        line.push('\n');
+        stream.write_all(line.as_bytes())?;
+        let mut reader = BufReader::new(stream);
+        let mut reply = String::new();
+        reader.read_line(&mut reply)?;
+        assert!(reply.contains("subscribed"), "{reply}");
+        Ok(reader)
+    };
+    let mut subscriber = subscribe()?;
+
+    install.install_new_build()?;
+    let started = Instant::now();
+    let upgraded = install.cued(&["upgrade", "--wait", "5s"])?;
+    assert!(upgraded.status.success(), "{}", text(&upgraded));
+    assert!(
+        text(&upgraded).contains("upgraded in place"),
+        "{}",
+        text(&upgraded)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the upgrade waited out the subscriber"
+    );
+    assert_eq!(install.daemon_pid(), Some(pid));
+    assert!(install.runs_installed_build(pid));
+
+    let mut rest = String::new();
+    assert_eq!(
+        subscriber.read_line(&mut rest)?,
+        0,
+        "the stream outlived the exec: {rest}"
+    );
+    subscribe()?;
+    Ok(())
+}
+
 #[test]
 fn no_daemon_means_nothing_to_upgrade() -> Result<()> {
     let install = Install::new()?;

@@ -1,6 +1,7 @@
 //! The CLI ↔ daemon wire protocol (DESIGN.md §5.1): newline-delimited JSON,
 //! one request → one reply, over the §7.3 peer-cred-authenticated socket.
-//! Boring on purpose. No streaming — `cued logs` reads files directly.
+//! Boring on purpose. The one stream is `Subscribe`'s, and it carries only
+//! "something changed", never data — `cued logs` reads files directly.
 
 use std::path::PathBuf;
 
@@ -87,6 +88,12 @@ pub enum RequestBody {
     /// `--wait`'s check before submitting: whether `Runs` would be refused,
     /// so a job is never created only to be refused a wait.
     WaitAllowed,
+    /// §5.1: turn this connection into a change stream. The daemon replies
+    /// `Subscribed`, then `Changed` after each commit that list, show, or
+    /// logs could see, coalescing ones that land close together. Nothing
+    /// else is read from the connection: the client closing it, or sending
+    /// anything more, ends the stream. Not offered over MCP.
+    Subscribe,
     /// §5.2 upgrade: finish the running steps, then re-exec the binary this
     /// daemon was started from, keeping its PID, locks and listening socket.
     ///
@@ -162,6 +169,12 @@ pub enum Response {
     JobRun(Box<JobRun>),
     /// Reply to `WaitAllowed` when it is.
     WaitAllowed,
+    /// Reply to `Subscribe`: the stream is open, and any change from here
+    /// on will be told. Fetch everything shown now; only `Changed` follows.
+    Subscribed,
+    /// On a subscribed connection: something committed since the last
+    /// notice. Refetch what is shown.
+    Changed,
     /// The job is cancelled; `runs` are the runs that were live and have
     /// been marked `Cancelled` (their processes, if any, are being torn
     /// down per §2.2 — the reply doesn't wait out `kill_grace`).
