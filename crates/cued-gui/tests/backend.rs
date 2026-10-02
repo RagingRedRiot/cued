@@ -238,3 +238,69 @@ fn controls_reach_the_daemon_and_their_effect_arrives_as_a_notice() {
         _ => false,
     });
 }
+
+/// The detail carries the job's workflow and, for each closed attempt,
+/// which transition the run took from it — what the step plan is drawn from.
+#[test]
+fn details_carry_the_workflow_and_the_transitions_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = temp_paths(dir.path());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    start_daemon(&runtime, &paths);
+    while cued::client::call(&paths, RequestBody::Ping).is_err() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let backend = Backend::start(paths.clone(), None, false, || {});
+    until(&backend, Duration::from_secs(10), |update| {
+        matches!(update, Update::Jobs(Ok(_)))
+    });
+    let graph = cued::submit::chain_graph(
+        "echo built",
+        &[cued::submit::Link::Then("echo tested".into())],
+        cued::submit::ChainFailure::Stop,
+    )
+    .unwrap();
+    let spec = JobSpec {
+        name: None,
+        schedule: Schedule::Once {
+            at: Timestamp::now()
+                .checked_sub(SignedDuration::from_secs(1))
+                .unwrap(),
+        },
+        graph,
+        cwd: "/".into(),
+        env: CapturedEnv::default(),
+        policies: Policies::default(),
+        hooks: Hooks::default(),
+    };
+    let job = match cued::client::call(
+        &paths,
+        RequestBody::Submit {
+            spec: Box::new(spec),
+        },
+    )
+    .unwrap()
+    {
+        Response::Submitted { job, .. } => job,
+        other => panic!("expected Submitted, got {other:?}"),
+    };
+    backend.send(Command::Select(Some(job)));
+    until(&backend, Duration::from_secs(20), |update| {
+        let Update::Detail(Some(Ok(Detail {
+            attempts, graph, ..
+        }))) = update
+        else {
+            return false;
+        };
+        if attempts.len() < 2 || attempts.iter().any(|attempt| attempt.ended_at.is_none()) {
+            return false;
+        }
+        let graph = graph.as_ref().expect("the workflow");
+        assert_eq!(graph.steps.len(), 2);
+        // The first step went on to the second by its only edge; the last
+        // matched none and ended the run.
+        assert_eq!(attempts[0].outcome_edge, Some(0));
+        assert_eq!(attempts[1].outcome_edge, None);
+        true
+    });
+}

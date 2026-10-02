@@ -112,6 +112,7 @@ fn attempt(step: &str, exit_code: Option<i32>, running: bool) -> LogAttempt {
         running,
         exit_code,
         timed_out: false,
+        outcome_edge: None,
     }
 }
 
@@ -163,6 +164,7 @@ fn selecting_a_job_shows_its_steps_and_the_running_log() {
             attempt("test", None, true),
         ],
         log: Some(log("test", "running tests\n")),
+        graph: None,
     }))));
     ui.harness.get_by_label_contains("build, exit 0, 20s");
     ui.harness.get_by_label_contains("test, running, 1m");
@@ -198,6 +200,7 @@ fn a_detail_for_a_job_no_longer_selected_is_ignored() {
         run: Some(RunId(1)),
         attempts: vec![attempt("build", Some(0), false)],
         log: None,
+        graph: None,
     }))));
     assert!(
         ui.harness
@@ -293,4 +296,50 @@ fn cancel_asks_first() {
     ui.harness.get_by_label("Cancel job").click();
     ui.settle();
     assert_eq!(ui.command(), Command::Act(JobId(2), Verb::Cancel));
+}
+
+#[test]
+fn the_steps_still_to_come_show_after_those_that_ran() {
+    let mut ui = Ui::new();
+    ui.send(Update::Link(Link::Live));
+    ui.send(Update::Jobs(Ok(jobs())));
+    ui.harness
+        .get_by_label("j1 pipeline, running, Running")
+        .click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::Select(Some(JobId(1))));
+
+    // j1 is listed as running at "test": build ran, test is running, and
+    // ship is still ahead.
+    let graph = cued::submit::chain_graph(
+        "./build.sh",
+        &[
+            cued::submit::Link::Then("./test.sh".into()),
+            cued::submit::Link::Then("./ship.sh".into()),
+        ],
+        cued::submit::ChainFailure::Stop,
+    )
+    .unwrap();
+    let names: Vec<String> = graph.steps.keys().cloned().collect();
+    let (first, second, third) = (&names[0], &names[1], &names[2]);
+    let mut ran = attempt(first, Some(0), false);
+    ran.outcome_edge = Some(0);
+    let running = attempt(second, None, true);
+    let mut jobs = jobs();
+    jobs[0].last_run.as_mut().unwrap().step = Some(second.clone());
+    ui.send(Update::Jobs(Ok(jobs)));
+    ui.send(Update::Detail(Some(Ok(Detail {
+        job: JobId(1),
+        run: Some(RunId(1)),
+        attempts: vec![ran, running],
+        log: None,
+        graph: Some(graph),
+    }))));
+
+    ui.harness
+        .get_by_label_contains(&format!("{first}, exit 0, 20s, succeeded → goto {second}"));
+    ui.harness.get_by_label_contains(&format!(
+        "{second}, running, 1m, then succeeded → goto {third}"
+    ));
+    ui.harness.get_by_label(&format!("{third}, pending"));
 }

@@ -383,6 +383,15 @@ screen, and elapsed times counting up while a run is shown. It starts a daemon
 when none is running as the window opens, from a `cued` binary it locates, and
 never afterwards: a daemon stopped on purpose stays stopped.
 
+A run is shown as its plan. The attempts come first, in the order they ran,
+each with the transition it took, so a branch or a loop reads as the path the
+run actually followed. A running step lists the transitions it may take, in
+evaluation order. The steps still reachable from the run's cursor follow,
+nearest first; a waiting run's next step says when it starts. Steps the run
+can no longer reach are marked not reached: the branches it didn't take. The
+workflow comes from `show` and is fetched once per job, since a definition
+never changes; each attempt's `outcome_edge` names the transition taken.
+
 The window offers continue, retry, pause, resume, and cancel, sending the same
 requests as the CLI verbs; cancel asks first. It shows only the verbs that can
 apply to the job as listed, and reports the daemon's refusal when one doesn't.

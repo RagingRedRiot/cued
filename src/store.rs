@@ -2159,7 +2159,7 @@ impl Store {
         // Sequential execution (§3) means started_at order is the order the
         // steps ran; attempt breaks ties for a step retried within a run.
         let rows = sqlx::query(
-            "SELECT step_id, attempt, started_at, ended_at, exit_code, timed_out
+            "SELECT step_id, attempt, started_at, ended_at, exit_code, timed_out, outcome_edge
              FROM step_runs WHERE job_id = ? AND run_id = ?
              ORDER BY started_at, attempt",
         )
@@ -2186,6 +2186,9 @@ impl Store {
                 ended_at,
                 exit_code: row.get("exit_code"),
                 timed_out: row.get::<i64, _>("timed_out") != 0,
+                outcome_edge: row
+                    .get::<Option<i64>, _>("outcome_edge")
+                    .map(|edge| edge as u32),
             };
             // Few attempts per run, so filtering here beats building the
             // SQL dynamically for two optional predicates.

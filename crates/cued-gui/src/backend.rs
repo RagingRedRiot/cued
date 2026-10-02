@@ -11,7 +11,7 @@
 //! sends no notice per line.
 use crate::model::Verb;
 use cued::client::{self, CallError, Subscription};
-use cued::model::{JobId, RunId};
+use cued::model::{Graph, JobId, RunId};
 use cued::paths::Paths;
 use cued::proto::{JobEntry, LogAttempt, RequestBody, Response};
 use std::io::{Read, Seek, SeekFrom};
@@ -54,6 +54,9 @@ pub struct Detail {
     pub run: Option<RunId>,
     pub attempts: Vec<LogAttempt>,
     pub log: Option<Log>,
+    /// The job's workflow, for the steps not yet run; `None` if it couldn't
+    /// be fetched, and the run's history is shown alone.
+    pub graph: Option<Graph>,
 }
 
 pub enum Update {
@@ -130,6 +133,7 @@ impl Backend {
             jobs: Vec::new(),
             link: Link::Connecting,
             following: None,
+            graphs: std::collections::HashMap::new(),
         };
         std::thread::Builder::new()
             .name("cued-fetch".into())
@@ -229,6 +233,9 @@ struct Fetcher {
     link: Link,
     /// The running attempt whose log is on screen, re-read every [`FOLLOW`].
     following: Option<(JobId, RunId, String, u32)>,
+    /// Workflows by job. A definition never changes once submitted, so each
+    /// is fetched once.
+    graphs: std::collections::HashMap<JobId, Graph>,
 }
 
 impl Fetcher {
@@ -363,6 +370,7 @@ impl Fetcher {
                 run: None,
                 attempts: Vec::new(),
                 log: None,
+                graph: self.graph(job),
             }));
         };
         let body = RequestBody::Logs {
@@ -396,7 +404,26 @@ impl Fetcher {
             run: Some(run),
             attempts,
             log,
+            graph: self.graph(job),
         }))
+    }
+
+    fn graph(&mut self, job: JobId) -> Option<Graph> {
+        if let Some(graph) = self.graphs.get(&job) {
+            return Some(graph.clone());
+        }
+        match client::call(
+            &self.paths,
+            RequestBody::Show {
+                job: job.to_string(),
+            },
+        ) {
+            Ok(Response::JobDetail { job: detail, .. }) => {
+                self.graphs.insert(job, detail.graph.clone());
+                Some(detail.graph)
+            }
+            _ => None,
+        }
     }
 
     /// Re-read the followed log; `false` once the UI is gone.

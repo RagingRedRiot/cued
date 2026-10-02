@@ -4,7 +4,7 @@
 //! clicks. It repaints when the backend has something new, and once a second
 //! only while a run on screen is counting up.
 use crate::backend::{Backend, Command, Detail, Link, Update};
-use crate::model::{self, Mark, Section, Tone, Verb};
+use crate::model::{self, Mark, PlanRow, Section, Tone, Verb};
 use crate::theme::{self, Palette, icon};
 use cued::model::JobId;
 use cued::proto::JobEntry;
@@ -27,6 +27,9 @@ pub struct App {
     outcome: Option<Result<String, String>>,
     /// A cancel waiting for confirmation.
     confirm_cancel: Option<JobId>,
+    /// The step row last scrolled into view, so it is scrolled to once when
+    /// it changes rather than pinned there.
+    scrolled_to: Option<(JobId, String, u32)>,
 }
 
 impl App {
@@ -42,6 +45,7 @@ impl App {
             acting: None,
             outcome: None,
             confirm_cancel: None,
+            scrolled_to: None,
         }
     }
 
@@ -344,29 +348,37 @@ impl App {
             .log
             .as_ref()
             .map(|log| (log.step.clone(), log.attempt));
+        let rows = match &detail.graph {
+            Some(graph) => model::plan(graph, &detail.attempts, job.last_run.as_ref(), job.next_at),
+            None => detail
+                .attempts
+                .iter()
+                .map(|attempt| PlanRow::Ran { attempt, via: None })
+                .collect(),
+        };
         let mut picked = None;
-        for attempt in &detail.attempts {
-            let key = (attempt.step.clone(), attempt.attempt);
-            let mark = model::attempt_mark(attempt);
-            let took = model::elapsed(attempt.started_at, attempt.ended_at, now);
-            let mut name = attempt.step.clone();
-            if attempt.attempt > 1 {
-                name.push_str(&format!(" · attempt {}", attempt.attempt));
-            }
-            let response = theme::list_row(ui, shown.as_ref() == Some(&key), |row| {
-                row.label(mark_glyph(row, &mark));
-                theme::row_text(row, theme::strong(name.clone()));
-                row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |row| {
-                    row.label(RichText::new(&took).color(p.faint));
-                    row.label(RichText::new(&mark.label).color(tone(p, mark.tone)));
-                });
+        // A long workflow scrolls on its own, leaving room for the output.
+        egui::ScrollArea::vertical()
+            .id_salt("steps")
+            .max_height(ui.available_height() * 0.5)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for row in &rows {
+                    let (clicked, response) = plan_row(ui, row, shown.as_ref(), now);
+                    if clicked.is_some() {
+                        picked = clicked;
+                    }
+                    // The step whose output is shown below, brought into view.
+                    if let (Some(response), Some((step, attempt))) = (response, &shown) {
+                        let key = (job.id, step.clone(), *attempt);
+                        if self.scrolled_to.as_ref() != Some(&key) {
+                            response.scroll_to_me(Some(egui::Align::Center));
+                            self.scrolled_to = Some(key);
+                        }
+                    }
+                }
             });
-            theme::name(&response, &format!("{name}, {}, {took}", mark.label));
-            if response.clicked() {
-                picked = Some(key);
-            }
-        }
-        if detail.attempts.is_empty() {
+        if rows.is_empty() {
             ui.label(RichText::new("No step has started yet.").color(p.muted));
         }
         if let Some(log) = &detail.log {
@@ -434,6 +446,70 @@ fn mark_glyph(ui: &egui::Ui, mark: &Mark) -> RichText {
     theme::glyph(mark.icon)
         .size(16.0)
         .color(tone(Palette::of(ui.visuals()), mark.tone))
+}
+
+/// One step of the plan: the attempt whose output was asked for, if
+/// clicked, and the row's response if it is the attempt shown.
+fn plan_row(
+    ui: &mut egui::Ui,
+    row: &PlanRow,
+    shown: Option<&(String, u32)>,
+    now: Timestamp,
+) -> (Option<(String, u32)>, Option<egui::Response>) {
+    let p = Palette::of(ui.visuals());
+    let quiet = |ui: &mut egui::Ui, icon: &str, step: &str, status: &str, color: Color32| {
+        let response = theme::list_row(ui, false, |row| {
+            row.label(theme::glyph(icon).size(16.0).color(color));
+            theme::row_text(row, RichText::new(step).color(color));
+            row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |row| {
+                row.label(RichText::new(status).color(color));
+            });
+        });
+        theme::name(&response, &format!("{step}, {status}"));
+    };
+    match row {
+        PlanRow::Ran { attempt, via } => {
+            let key = (attempt.step.clone(), attempt.attempt);
+            let mark = model::attempt_mark(attempt);
+            let took = model::elapsed(attempt.started_at, attempt.ended_at, now);
+            let mut name = attempt.step.clone();
+            if attempt.attempt > 1 {
+                name.push_str(&format!(" · attempt {}", attempt.attempt));
+            }
+            let height = if via.is_some() { 42.0 } else { 28.0 };
+            let response = theme::list_row_sized(ui, shown == Some(&key), height, |row| {
+                row.label(mark_glyph(row, &mark));
+                row.vertical(|lines| {
+                    lines.spacing_mut().item_spacing.y = 1.0;
+                    theme::row_text(lines, theme::strong(name.clone()));
+                    if let Some(via) = via {
+                        theme::row_text(lines, RichText::new(via).size(12.0).color(p.faint));
+                    }
+                });
+                row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |row| {
+                    row.label(RichText::new(&took).color(p.faint));
+                    row.label(RichText::new(&mark.label).color(tone(p, mark.tone)));
+                });
+            });
+            let mut label = format!("{name}, {}, {took}", mark.label);
+            if let Some(via) = via {
+                label.push_str(&format!(", {via}"));
+            }
+            theme::name(&response, &label);
+            let clicked = response.clicked().then(|| key.clone());
+            return (clicked, (shown == Some(&key)).then_some(response));
+        }
+        PlanRow::Next { step, at } => {
+            let when = match at {
+                Some(at) => format!("next, {}", model::relative(*at, now)),
+                None => "next".into(),
+            };
+            quiet(ui, icon::CLOCK, step, &when, p.accent_text);
+        }
+        PlanRow::Pending { step } => quiet(ui, icon::CIRCLE_DASHED, step, "pending", p.muted),
+        PlanRow::Unreached { step } => quiet(ui, icon::MINUS_CIRCLE, step, "not reached", p.faint),
+    }
+    (None, None)
 }
 
 /// A two-line job row: its mark, title, and where it stands.

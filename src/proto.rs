@@ -291,6 +291,10 @@ pub struct LogAttempt {
     pub running: bool,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    /// Which of the step's transitions the run took when this attempt
+    /// closed, by index (§3.2). `None` while it is open, or when no
+    /// transition matched and the run ended on the attempt's own result.
+    pub outcome_edge: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

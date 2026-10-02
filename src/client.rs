@@ -1634,7 +1634,8 @@ fn describe_hooks(hooks: &Hooks) -> String {
     .join(", ")
 }
 
-fn describe_condition(when: &Condition) -> String {
+/// A transition's condition as `cued show` prints it: "failed", "exit == 3".
+pub fn describe_condition(when: &Condition) -> String {
     match when {
         Condition::Always => "always".into(),
         Condition::Succeeded => "succeeded".into(),
@@ -1660,7 +1661,8 @@ fn describe_match(matcher: &OutputMatch) -> String {
     }
 }
 
-fn describe_effect(then: &Effect) -> String {
+/// A transition's effect as `cued show` prints it: "goto deploy", "end (Failure)".
+pub fn describe_effect(then: &Effect) -> String {
     match then {
         Effect::End { outcome } => format!("end ({outcome:?})"),
         Effect::Goto { step, after: None } => format!("goto {step}"),

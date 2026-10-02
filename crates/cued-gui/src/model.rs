@@ -2,8 +2,8 @@
 //! belongs in, and the mark and words for each status. Pure, so it is tested
 //! directly rather than through pixels.
 use crate::theme::icon;
-use cued::model::{ApprovalState, JobStatus, RunStatus};
-use cued::proto::{JobEntry, LogAttempt};
+use cued::model::{ApprovalState, Effect, Graph, JobStatus, RunStatus, Transition};
+use cued::proto::{JobEntry, LogAttempt, RunEntry};
 use jiff::{SignedDuration, Timestamp};
 
 /// The window's groups, in display order.
@@ -355,6 +355,135 @@ pub fn verbs(job: &JobEntry) -> Vec<Verb> {
     verbs
 }
 
+/// One row of a run's plan: the steps it ran, in order, then the steps it
+/// may still run, then those it can no longer reach.
+#[derive(Debug, Clone)]
+pub enum PlanRow<'a> {
+    /// An attempt that ran or is running. `via` says where the run went
+    /// from it ("failed → goto rollback"), or, while it runs, where it may go.
+    Ran {
+        attempt: &'a LogAttempt,
+        via: Option<String>,
+    },
+    /// The step a waiting run starts next, and when.
+    Next {
+        step: &'a str,
+        at: Option<Timestamp>,
+    },
+    /// A step the run can still reach from where it is.
+    Pending { step: &'a str },
+    /// A step the run can no longer reach: a branch not taken.
+    Unreached { step: &'a str },
+}
+
+/// "failed → goto rollback"
+fn describe_transition(transition: &Transition) -> String {
+    format!(
+        "{} → {}",
+        cued::client::describe_condition(&transition.when),
+        cued::client::describe_effect(&transition.then)
+    )
+}
+
+/// Where a closed attempt sent the run.
+fn took(graph: &Graph, attempt: &LogAttempt) -> Option<String> {
+    if attempt.running || attempt.ended_at.is_none() {
+        return None;
+    }
+    let transitions = &graph.steps.get(&attempt.step)?.transitions;
+    Some(match attempt.outcome_edge {
+        Some(edge) => describe_transition(transitions.get(edge as usize)?),
+        None => "no transition matched → end".into(),
+    })
+}
+
+/// Where a running attempt may send the run: its transitions, in the order
+/// they are tried.
+fn may_take(graph: &Graph, step: &str) -> Option<String> {
+    let transitions = &graph.steps.get(step)?.transitions;
+    if transitions.is_empty() {
+        return Some("then the run ends".into());
+    }
+    let options: Vec<String> = transitions.iter().map(describe_transition).collect();
+    Some(format!("then {}", options.join(" · ")))
+}
+
+/// Steps reachable from `from` by goto edges, nearest first, in the order
+/// edges are tried. `from` itself only if a loop leads back to it.
+fn reachable<'a>(graph: &'a Graph, from: &str) -> Vec<&'a str> {
+    let mut seen: Vec<&'a str> = Vec::new();
+    let mut queue = std::collections::VecDeque::from([from]);
+    while let Some(step) = queue.pop_front() {
+        let Some(node) = graph.steps.get(step) else {
+            continue;
+        };
+        for transition in &node.transitions {
+            if let Effect::Goto { step: target, .. } = &transition.then
+                && !seen.contains(&target.as_str())
+            {
+                seen.push(target.as_str());
+                queue.push_back(target.as_str());
+            }
+        }
+    }
+    seen
+}
+
+/// The run's plan. `run` is the job's latest run as listed; `next_at` the
+/// listed wake time of a waiting run.
+pub fn plan<'a>(
+    graph: &'a Graph,
+    attempts: &'a [LogAttempt],
+    run: Option<&'a RunEntry>,
+    next_at: Option<Timestamp>,
+) -> Vec<PlanRow<'a>> {
+    let mut rows: Vec<PlanRow<'a>> = attempts
+        .iter()
+        .map(|attempt| PlanRow::Ran {
+            attempt,
+            via: if attempt.running {
+                may_take(graph, &attempt.step)
+            } else {
+                took(graph, attempt)
+            },
+        })
+        .collect();
+    let ran = |step: &str| attempts.iter().any(|attempt| attempt.step == step);
+    let mut placed: Vec<&str> = Vec::new();
+    // The cursor of a live run: where it is, and so what it can still reach.
+    if let Some(run) = run
+        && let Some(here) = graph
+            .steps
+            .get_key_value(run.step.as_deref().unwrap_or_default())
+    {
+        let here = here.0.as_str();
+        if matches!(run.status, RunStatus::Pending | RunStatus::Waiting) {
+            rows.push(PlanRow::Next {
+                step: here,
+                at: next_at,
+            });
+            placed.push(here);
+        }
+        for step in reachable(graph, here) {
+            if !ran(step) && !placed.contains(&step) {
+                rows.push(PlanRow::Pending { step });
+                placed.push(step);
+            }
+        }
+    }
+    // Everything else never ran and can't now: entry order, then the rest.
+    let mut order = vec![graph.entry.as_str()];
+    order.extend(reachable(graph, &graph.entry));
+    order.extend(graph.steps.keys().map(String::as_str));
+    for step in order {
+        if !ran(step) && !placed.contains(&step) {
+            rows.push(PlanRow::Unreached { step });
+            placed.push(step);
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +581,171 @@ mod tests {
         assert_eq!(verbs(&skipped), []);
     }
 
+    /// ship-it from the demo: a flaky test that loops through clear-cache,
+    /// and a deploy that falls back to rollback instead of smoke-test.
+    fn ship_it() -> Graph {
+        use cued::model::{Action, Condition, Outcome, Step};
+        let goto = |step: &str| Effect::Goto {
+            step: step.into(),
+            after: None,
+        };
+        let step = |edges: Vec<(Condition, Effect)>| Step {
+            action: Action::Shell {
+                argv: vec!["true".into()],
+            },
+            cwd: None,
+            env: None,
+            timeout: None,
+            kill_grace: None,
+            transitions: edges
+                .into_iter()
+                .map(|(when, then)| Transition { when, then })
+                .collect(),
+            max_visits: None,
+            restart_safe: false,
+            missed_wait: None,
+        };
+        let fail = Effect::End {
+            outcome: Outcome::Failure,
+        };
+        Graph {
+            entry: "build".into(),
+            steps: [
+                ("build", step(vec![(Condition::Succeeded, goto("test"))])),
+                (
+                    "test",
+                    step(vec![
+                        (Condition::Succeeded, goto("deploy")),
+                        (Condition::Failed, goto("clear-cache")),
+                    ]),
+                ),
+                (
+                    "clear-cache",
+                    step(vec![(Condition::Succeeded, goto("test"))]),
+                ),
+                (
+                    "deploy",
+                    step(vec![
+                        (Condition::Succeeded, goto("smoke-test")),
+                        (Condition::Failed, goto("rollback")),
+                    ]),
+                ),
+                ("smoke-test", step(vec![])),
+                ("rollback", step(vec![(Condition::Always, fail)])),
+            ]
+            .into_iter()
+            .map(|(id, step)| (id.to_string(), step))
+            .collect(),
+        }
+    }
+
+    fn ran(step: &str, attempt: u32, edge: Option<u32>, running: bool) -> LogAttempt {
+        LogAttempt {
+            step: step.into(),
+            attempt,
+            started_at: at(0),
+            ended_at: (!running).then(|| at(4)),
+            running,
+            exit_code: (!running).then_some(0),
+            timed_out: false,
+            outcome_edge: edge,
+        }
+    }
+
+    /// The plan as text, one row each.
+    fn read(rows: &[PlanRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                PlanRow::Ran { attempt, via } => format!(
+                    "ran {}#{}: {}",
+                    attempt.step,
+                    attempt.attempt,
+                    via.as_deref().unwrap_or("-")
+                ),
+                PlanRow::Next { step, at } => format!("next {step} at {at:?}"),
+                PlanRow::Pending { step } => format!("pending {step}"),
+                PlanRow::Unreached { step } => format!("unreached {step}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_finished_run_shows_the_path_it_took_and_the_branch_it_did_not() {
+        let graph = ship_it();
+        let attempts = [
+            ran("build", 1, Some(0), false),
+            ran("test", 1, Some(1), false),
+            ran("clear-cache", 1, Some(0), false),
+            ran("test", 2, Some(0), false),
+            ran("deploy", 1, Some(1), false),
+            ran("rollback", 1, Some(0), false),
+        ];
+        let mut done = run(RunStatus::Failed);
+        done.ended_at = Some(at(30));
+        assert_eq!(
+            read(&plan(&graph, &attempts, Some(&done), None)),
+            [
+                "ran build#1: succeeded → goto test",
+                "ran test#1: failed → goto clear-cache",
+                "ran clear-cache#1: succeeded → goto test",
+                "ran test#2: succeeded → goto deploy",
+                "ran deploy#1: failed → goto rollback",
+                "ran rollback#1: always → end (Failure)",
+                "unreached smoke-test",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_running_step_lists_where_it_may_go_and_what_is_still_reachable() {
+        let graph = ship_it();
+        let attempts = [ran("build", 1, Some(0), false), ran("test", 1, None, true)];
+        let mut live = run(RunStatus::Running);
+        live.step = Some("test".into());
+        assert_eq!(
+            read(&plan(&graph, &attempts, Some(&live), None)),
+            [
+                "ran build#1: succeeded → goto test",
+                "ran test#1: then succeeded → goto deploy · failed → goto clear-cache",
+                "pending deploy",
+                "pending clear-cache",
+                "pending smoke-test",
+                "pending rollback",
+            ]
+        );
+
+        // Past the deploy that failed: smoke-test can no longer happen.
+        let attempts = [
+            ran("build", 1, Some(0), false),
+            ran("test", 1, Some(0), false),
+            ran("deploy", 1, Some(1), false),
+            ran("rollback", 1, None, true),
+        ];
+        live.step = Some("rollback".into());
+        assert_eq!(
+            read(&plan(&graph, &attempts, Some(&live), None))[4..],
+            ["unreached clear-cache", "unreached smoke-test"]
+        );
+    }
+
+    #[test]
+    fn a_waiting_run_shows_its_next_step_and_when() {
+        let graph = ship_it();
+        let attempts = [ran("build", 1, Some(0), false)];
+        let mut waiting = run(RunStatus::Waiting);
+        waiting.step = Some("test".into());
+        let rows = plan(&graph, &attempts, Some(&waiting), Some(at(900)));
+        assert_eq!(read(&rows)[1], format!("next test at {:?}", Some(at(900))));
+        assert_eq!(read(&rows)[2], "pending deploy");
+
+        // A step with no matching transition ends the run on its own result.
+        let attempts = [ran("smoke-test", 1, None, false)];
+        assert_eq!(
+            read(&plan(&graph, &attempts, None, None))[0],
+            "ran smoke-test#1: no transition matched → end"
+        );
+    }
+
     #[test]
     fn sections_keep_their_own_order_and_drop_when_empty() {
         let mut soon = job(1, JobStatus::Active, None);
@@ -507,6 +801,7 @@ mod tests {
                 running,
                 exit_code,
                 timed_out,
+                outcome_edge: None,
             };
         let label = |a: &LogAttempt| attempt_mark(a).label;
         assert_eq!(label(&attempt(None, false, true, false)), "running");
