@@ -420,3 +420,24 @@ fn the_steps_still_to_come_show_after_those_that_ran() {
     ));
     ui.harness.get_by_label(&format!("{third}, pending"));
 }
+
+/// The job list keeps its width when the first thing it shows is short:
+/// "Loading…" or the empty-list hint. A side panel takes the size of what it
+/// drew, so text that doesn't claim the width shrinks it, and jobs that
+/// arrive later stay squeezed.
+#[test]
+fn the_job_list_keeps_its_width_when_it_starts_empty() {
+    let mut ui = Ui::new();
+    ui.send(Update::Link(Link::Live));
+    ui.send(Update::Jobs(Ok(Vec::new())));
+    ui.send(Update::Jobs(Ok(jobs())));
+    let row = ui
+        .harness
+        .get_by_label("j1 pipeline, running, Running")
+        .rect();
+    assert!(
+        row.width() > 300.0,
+        "rows squeezed to {} points",
+        row.width()
+    );
+}
