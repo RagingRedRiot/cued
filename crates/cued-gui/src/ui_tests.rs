@@ -343,3 +343,45 @@ fn the_steps_still_to_come_show_after_those_that_ran() {
     ));
     ui.harness.get_by_label(&format!("{third}, pending"));
 }
+
+#[test]
+fn the_graph_view_draws_each_step_as_a_box_and_a_click_shows_its_output() {
+    let mut ui = Ui::new();
+    ui.send(Update::Link(Link::Live));
+    ui.send(Update::Jobs(Ok(jobs())));
+    ui.harness.get_by_label("j3 backup, done, Recent").click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::Select(Some(JobId(3))));
+    let graph = cued::submit::chain_graph(
+        "./dump.sh",
+        &[cued::submit::Link::Then("./upload.sh".into())],
+        cued::submit::ChainFailure::Stop,
+    )
+    .unwrap();
+    let names: Vec<String> = graph.steps.keys().cloned().collect();
+    let mut first = attempt(&names[0], Some(0), false);
+    first.outcome_edge = Some(0);
+    let second = attempt(&names[1], Some(0), false);
+    ui.send(Update::Detail(Some(Ok(Detail {
+        job: JobId(3),
+        run: Some(RunId(1)),
+        attempts: vec![first, second],
+        log: Some(log(&names[1], "uploaded\n")),
+        graph: Some(graph),
+    }))));
+
+    assert!(
+        ui.harness.query_by_label_contains(" box, ").is_none(),
+        "the list is the default"
+    );
+    ui.harness.get_by_label("Graph").click();
+    ui.settle();
+    ui.harness
+        .get_by_label(&format!("{} box, exit 0 · 20s", names[0]))
+        .click();
+    ui.settle();
+    assert_eq!(ui.command(), Command::ShowLog(Some((names[0].clone(), 1))));
+    ui.harness.get_by_label("List").click();
+    ui.settle();
+    assert!(ui.harness.query_by_label_contains(" box, ").is_none());
+}

@@ -392,6 +392,17 @@ can no longer reach are marked not reached: the branches it didn't take. The
 workflow comes from `show` and is fetched once per job, since a definition
 never changes; each attempt's `outcome_edge` names the transition taken.
 
+The same plan can be drawn as the workflow: a box per step, in columns so each
+step sits right of every step that can lead to it, with an arrow per pair of
+steps a goto joins, labeled with its conditions. A depth-first walk from the
+entry, edges in evaluation order, finds the edges that lead back; those loop
+arrows run along lanes under the boxes and through the gaps between columns,
+so they cross arrows but never a box. A step whose only way on is back sits
+below the main line. The edges the run took are bold, the rest faint, and the
+boxes carry the plan's states. The drawing shrinks to fit the pane, down to
+70%, and scrolls beyond that. End transitions draw no arrow; the list says
+where a run ended.
+
 The window offers continue, retry, pause, resume, and cancel, sending the same
 requests as the CLI verbs; cancel asks first. It shows only the verbs that can
 apply to the job as listed, and reports the daemon's refusal when one doesn't.

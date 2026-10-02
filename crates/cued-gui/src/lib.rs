@@ -2,6 +2,7 @@
 //! step by step, kept current by the daemon's change stream (DESIGN.md §5.1).
 pub mod app;
 pub mod backend;
+pub mod flow;
 pub mod model;
 pub mod theme;
 #[cfg(test)]

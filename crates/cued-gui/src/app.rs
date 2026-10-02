@@ -4,6 +4,7 @@
 //! clicks. It repaints when the backend has something new, and once a second
 //! only while a run on screen is counting up.
 use crate::backend::{Backend, Command, Detail, Link, Update};
+use crate::flow;
 use crate::model::{self, Mark, PlanRow, Section, Tone, Verb};
 use crate::theme::{self, Palette, icon};
 use cued::model::JobId;
@@ -30,6 +31,8 @@ pub struct App {
     /// The step row last scrolled into view, so it is scrolled to once when
     /// it changes rather than pinned there.
     scrolled_to: Option<(JobId, String, u32)>,
+    /// Steps as a list or as the workflow drawn.
+    as_graph: bool,
 }
 
 impl App {
@@ -46,6 +49,7 @@ impl App {
             outcome: None,
             confirm_cancel: None,
             scrolled_to: None,
+            as_graph: false,
         }
     }
 
@@ -343,7 +347,15 @@ impl App {
             ui.label(RichText::new("No runs yet.").color(p.muted));
             return;
         }
-        ui.label(theme::eyebrow(ui, "Steps"));
+        ui.horizontal(|ui| {
+            ui.label(theme::eyebrow(ui, "Steps"));
+            if detail.graph.is_some() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.selectable_value(&mut self.as_graph, true, "Graph");
+                    ui.selectable_value(&mut self.as_graph, false, "List");
+                });
+            }
+        });
         let shown = detail
             .log
             .as_ref()
@@ -357,27 +369,40 @@ impl App {
                 .collect(),
         };
         let mut picked = None;
-        // A long workflow scrolls on its own, leaving room for the output.
-        egui::ScrollArea::vertical()
-            .id_salt("steps")
-            .max_height(ui.available_height() * 0.5)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for row in &rows {
-                    let (clicked, response) = plan_row(ui, row, shown.as_ref(), now);
-                    if clicked.is_some() {
-                        picked = clicked;
-                    }
-                    // The step whose output is shown below, brought into view.
-                    if let (Some(response), Some((step, attempt))) = (response, &shown) {
-                        let key = (job.id, step.clone(), *attempt);
-                        if self.scrolled_to.as_ref() != Some(&key) {
-                            response.scroll_to_me(Some(egui::Align::Center));
-                            self.scrolled_to = Some(key);
+        if let (true, Some(graph)) = (self.as_graph, &detail.graph) {
+            let layout = flow::layout(graph);
+            let states = flow::states(&rows, now);
+            let taken = flow::taken(&layout, &detail.attempts);
+            egui::ScrollArea::both()
+                .id_salt("flow")
+                .max_height(ui.available_height() * 0.5)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    picked = flow::show(ui, &layout, &states, &taken, shown.as_ref());
+                });
+        } else {
+            // A long workflow scrolls on its own, leaving room for the output.
+            egui::ScrollArea::vertical()
+                .id_salt("steps")
+                .max_height(ui.available_height() * 0.5)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for row in &rows {
+                        let (clicked, response) = plan_row(ui, row, shown.as_ref(), now);
+                        if clicked.is_some() {
+                            picked = clicked;
+                        }
+                        // The step whose output is shown below, brought into view.
+                        if let (Some(response), Some((step, attempt))) = (response, &shown) {
+                            let key = (job.id, step.clone(), *attempt);
+                            if self.scrolled_to.as_ref() != Some(&key) {
+                                response.scroll_to_me(Some(egui::Align::Center));
+                                self.scrolled_to = Some(key);
+                            }
                         }
                     }
-                }
-            });
+                });
+        }
         if rows.is_empty() {
             ui.label(RichText::new("No step has started yet.").color(p.muted));
         }
