@@ -399,7 +399,12 @@ entry, edges in evaluation order, finds the edges that lead back; those loop
 arrows run along lanes under the boxes and through the gaps between columns,
 so they cross arrows but never a box. A step whose only way on is back sits
 below the main line. The edges the run took are bold, the rest faint, and the
-boxes carry the plan's states. The drawing shrinks to fit the pane, down to
+boxes carry the plan's states. Loops are counted within the run's current
+epoch, as `max_visits` is: a box shows its visits ("×3 of 5" against its
+limit, "×3" without one), an arrow taken more than once carries a "×N"
+badge, and both turn the warning color once a step has used more than half
+its allowed visits. Each attempt's `epoch` comes with it, so a run rewound by
+`cued retry` counts only its current pass. The drawing shrinks to fit the pane, down to
 70%, and scrolls beyond that. End transitions draw no arrow; the list says
 where a run ended.
 

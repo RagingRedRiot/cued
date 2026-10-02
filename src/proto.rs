@@ -295,6 +295,11 @@ pub struct LogAttempt {
     /// closed, by index (§3.2). `None` while it is open, or when no
     /// transition matched and the run ended on the attempt's own result.
     pub outcome_edge: Option<u32>,
+    /// The run's rewind generation when this attempt began (§3.4): `cued
+    /// retry` starts a new one, and `max_visits` counts within it. Defaults
+    /// to 0, a run never rewound, for a daemon too old to send it.
+    #[serde(default)]
+    pub epoch: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

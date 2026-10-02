@@ -649,6 +649,7 @@ mod tests {
             exit_code: (!running).then_some(0),
             timed_out: false,
             outcome_edge: edge,
+            epoch: 0,
         }
     }
 
@@ -802,6 +803,7 @@ mod tests {
                 exit_code,
                 timed_out,
                 outcome_edge: None,
+                epoch: 0,
             };
         let label = |a: &LogAttempt| attempt_mark(a).label;
         assert_eq!(label(&attempt(None, false, true, false)), "running");

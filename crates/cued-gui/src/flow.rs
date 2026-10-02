@@ -191,11 +191,19 @@ pub fn layout(graph: &Graph) -> Layout {
     }
 }
 
-/// The edges the run took: each closed attempt's transition, when it was a
-/// goto drawn here.
-pub fn taken(layout: &Layout, attempts: &[LogAttempt]) -> Vec<usize> {
-    let mut taken = Vec::new();
-    for attempt in attempts {
+/// The run's current pass: the newest epoch any attempt began in. `cued
+/// retry` starts a new one, and loops are counted within it, as the daemon
+/// counts `max_visits` (§3.4).
+fn current_epoch(attempts: &[LogAttempt]) -> u32 {
+    attempts.iter().map(|a| a.epoch).max().unwrap_or(0)
+}
+
+/// How often the run took each edge in its current pass, by edge index:
+/// each closed attempt's transition, when it was a goto drawn here.
+pub fn taken(layout: &Layout, attempts: &[LogAttempt]) -> BTreeMap<usize, u32> {
+    let epoch = current_epoch(attempts);
+    let mut taken = BTreeMap::new();
+    for attempt in attempts.iter().filter(|a| a.epoch == epoch) {
         let (Some(from), Some(edge)) = (layout.index(&attempt.step), attempt.outcome_edge) else {
             continue;
         };
@@ -203,12 +211,37 @@ pub fn taken(layout: &Layout, attempts: &[LogAttempt]) -> Vec<usize> {
             .edges
             .iter()
             .position(|e| e.from == from && e.transitions.contains(&edge))
-            && !taken.contains(&index)
         {
-            taken.push(index);
+            *taken.entry(index).or_insert(0) += 1;
         }
     }
     taken
+}
+
+/// How often the run has entered a step in its current pass, against the
+/// step's `max_visits` if it has one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Visits {
+    pub count: u32,
+    pub limit: Option<u32>,
+}
+
+impl Visits {
+    /// Most of the allowed visits are used: one more loop or two and the
+    /// run fails with `max_visits`. A limit of one is no loop, so no warning.
+    pub fn near_limit(self) -> bool {
+        self.limit
+            .is_some_and(|limit| limit >= 2 && self.count * 2 > limit)
+    }
+
+    /// "×3 of 5", or "×3" without a limit; nothing for a single unbounded visit.
+    pub fn text(self) -> Option<String> {
+        match self.limit {
+            Some(limit) if self.count > 0 => Some(format!("×{} of {limit}", self.count)),
+            None if self.count > 1 => Some(format!("×{}", self.count)),
+            _ => None,
+        }
+    }
 }
 
 /// What a box says about its step.
@@ -218,7 +251,7 @@ pub enum State {
     Ran {
         mark: Mark,
         detail: String,
-        visits: usize,
+        visits: Visits,
         running: bool,
         latest: (String, u32),
     },
@@ -227,15 +260,35 @@ pub enum State {
     Unreached,
 }
 
+impl State {
+    pub fn visits(&self) -> Option<Visits> {
+        match self {
+            State::Ran { visits, .. } => Some(*visits),
+            _ => None,
+        }
+    }
+}
+
 /// Each step's state, from the run's plan.
-pub fn states(rows: &[PlanRow], now: Timestamp) -> BTreeMap<String, State> {
+pub fn states(rows: &[PlanRow], graph: &Graph, now: Timestamp) -> BTreeMap<String, State> {
+    let attempts: Vec<&LogAttempt> = rows
+        .iter()
+        .filter_map(|row| match row {
+            PlanRow::Ran { attempt, .. } => Some(*attempt),
+            _ => None,
+        })
+        .collect();
+    let epoch = attempts.iter().map(|a| a.epoch).max().unwrap_or(0);
     let mut states = BTreeMap::new();
     for row in rows {
         let (step, state) = match row {
             PlanRow::Ran { attempt, .. } => {
-                let visits = match states.get(&attempt.step) {
-                    Some(State::Ran { visits, .. }) => visits + 1,
-                    _ => 1,
+                let visits = Visits {
+                    count: attempts
+                        .iter()
+                        .filter(|a| a.step == attempt.step && a.epoch == epoch)
+                        .count() as u32,
+                    limit: graph.steps.get(&attempt.step).and_then(|s| s.max_visits),
                 };
                 let mark = model::attempt_mark(attempt);
                 let took = model::elapsed(attempt.started_at, attempt.ended_at, now);
@@ -273,6 +326,20 @@ struct Geometry {
     grid_bottom: f32,
 }
 
+/// How far a loop arrow turns out beside a box: into the gap between
+/// columns, or past the first or last column.
+fn loop_reach(lane: usize) -> f32 {
+    COLUMN_GAP * 0.3 + lane as f32 * 6.0
+}
+
+/// Room left and right of the columns for the loops that turn there.
+fn side_room(layout: &Layout) -> f32 {
+    match layout.edges.iter().filter(|e| e.back).count() {
+        0 => 0.0,
+        loops => loop_reach(loops - 1) + 8.0,
+    }
+}
+
 impl Geometry {
     fn natural(layout: &Layout) -> Vec2 {
         let loops = layout.edges.iter().filter(|e| e.back).count();
@@ -282,13 +349,14 @@ impl Geometry {
             LANE + (loops - 1) as f32 * LANE_STEP + 14.0
         };
         Vec2::new(
-            2.0 * MARGIN + layout.columns() as f32 * (NODE.x + COLUMN_GAP) - COLUMN_GAP,
+            2.0 * (MARGIN + side_room(layout)) + layout.columns() as f32 * (NODE.x + COLUMN_GAP)
+                - COLUMN_GAP,
             2.0 * MARGIN + layout.rows() as f32 * (NODE.y + ROW_GAP) - ROW_GAP + lanes,
         )
     }
 
     fn node(&self, layout: &Layout, step: usize) -> Rect {
-        let x = MARGIN + layout.column[step] as f32 * (NODE.x + COLUMN_GAP);
+        let x = MARGIN + side_room(layout) + layout.column[step] as f32 * (NODE.x + COLUMN_GAP);
         let y = MARGIN + layout.row[step] as f32 * (NODE.y + ROW_GAP);
         Rect::from_min_size(
             self.origin + Vec2::new(x, y) * self.scale,
@@ -343,7 +411,7 @@ pub fn show(
     ui: &mut egui::Ui,
     layout: &Layout,
     states: &BTreeMap<String, State>,
-    taken: &[usize],
+    taken: &BTreeMap<usize, u32>,
     shown: Option<&(String, u32)>,
 ) -> Option<(String, u32)> {
     let p = Palette::of(ui.visuals());
@@ -369,7 +437,7 @@ pub fn show(
 
     // Untaken edges first, so the path is drawn over them.
     let mut order: Vec<usize> = (0..layout.edges.len()).collect();
-    order.sort_by_key(|i| taken.contains(i));
+    order.sort_by_key(|i| taken.contains_key(i));
     let mut lane = 0;
     let lanes: Vec<Option<usize>> = layout
         .edges
@@ -383,7 +451,7 @@ pub fn show(
         .collect();
     for index in order {
         let edge = &layout.edges[index];
-        let on_path = taken.contains(&index);
+        let on_path = taken.contains_key(&index);
         let color = if on_path { p.accent } else { p.faint };
         let stroke = Stroke::new(if on_path { 2.0 } else { 1.2 }, color);
         let from = g.node(layout, edge.from);
@@ -396,8 +464,8 @@ pub fn show(
             let offset = Vec2::new(0.0, g.px(10.0));
             let start = from.right_center() + offset;
             let end = to.left_center() + offset;
-            let out = start.x + g.px(COLUMN_GAP * 0.3 + lane as f32 * 6.0);
-            let back = end.x - g.px(COLUMN_GAP * 0.3 + lane as f32 * 6.0);
+            let out = start.x + g.px(loop_reach(lane));
+            let back = end.x - g.px(loop_reach(lane));
             let points = [
                 start,
                 Pos2::new(out, start.y),
@@ -427,12 +495,42 @@ pub fn show(
         arrowhead(&painter, tip, tail, color, scale);
         let galley = label(&edge.label, if on_path { p.accent_text } else { p.faint });
         let at = middle - galley.size() / 2.0;
+        let label_rect = Rect::from_min_size(at, galley.size());
         painter.rect_filled(
-            Rect::from_min_size(at, galley.size()).expand2(Vec2::new(3.0, 1.0)),
+            label_rect.expand2(Vec2::new(3.0, 1.0)),
             CornerRadius::same(3),
             p.canvas,
         );
         painter.galley(at, galley, color);
+        // How many times the run went this way, when more than once: the
+        // count of a retry loop. Warning-colored as the step it leads to
+        // nears its `max_visits`.
+        if let Some(&count) = taken.get(&index).filter(|&&count| count > 1) {
+            let target = states.get(&layout.steps[edge.to]).and_then(State::visits);
+            let (fill, ink) = if target.is_some_and(Visits::near_limit) {
+                (p.warning_soft, p.warning)
+            } else {
+                (p.accent_soft, p.accent_text)
+            };
+            let badge = egui::WidgetText::from(
+                egui::RichText::new(format!("×{count}"))
+                    .size(10.5 * scale)
+                    .family(theme::semibold())
+                    .color(ink),
+            )
+            .into_galley(ui, None, f32::INFINITY, egui::TextStyle::Small);
+            let pad = Vec2::new(g.px(5.0), g.px(1.0));
+            let min = Pos2::new(
+                label_rect.right() + g.px(10.0),
+                middle.y - badge.size().y / 2.0,
+            );
+            painter.rect_filled(
+                Rect::from_min_size(min, badge.size()).expand2(pad),
+                CornerRadius::same(8),
+                fill,
+            );
+            painter.galley(min, badge, ink);
+        }
     }
 
     let mut clicked = None;
@@ -449,13 +547,14 @@ pub fn show(
                 running,
                 ..
             } => {
-                let status = if *visits > 1 {
-                    format!("{detail} · ×{visits}")
-                } else {
-                    detail.clone()
+                let status = match visits.text() {
+                    Some(count) => format!("{detail} · {count}"),
+                    None => detail.clone(),
                 };
                 let border = if *running {
                     Stroke::new(1.5, p.accent)
+                } else if visits.near_limit() {
+                    Stroke::new(1.5, p.warning)
                 } else {
                     Stroke::new(1.0, p.hairline)
                 };
@@ -516,12 +615,17 @@ pub fn show(
         );
         let text_left = inner.left() + g.px(24.0);
         let width = inner.right() - text_left;
+        let status_color = if state.visits().is_some_and(Visits::near_limit) {
+            p.warning
+        } else {
+            p.faint
+        };
         for (line, (text, size, color, family)) in [
             (step.as_str(), 13.0, text_color, theme::medium()),
             (
                 status.as_str(),
                 11.0,
-                p.faint,
+                status_color,
                 egui::FontFamily::Proportional,
             ),
         ]
@@ -732,10 +836,8 @@ mod tests {
         assert_eq!(layout.steps.last().map(String::as_str), Some("orphan"));
     }
 
-    #[test]
-    fn the_path_taken_is_each_closed_attempt_s_transition() {
-        let layout = layout(&ship_it());
-        let attempt = |step: &str, edge: Option<u32>| LogAttempt {
+    fn closed(step: &str, edge: Option<u32>, epoch: u32) -> LogAttempt {
+        LogAttempt {
             step: step.into(),
             attempt: 1,
             started_at: Timestamp::UNIX_EPOCH,
@@ -744,32 +846,136 @@ mod tests {
             exit_code: Some(0),
             timed_out: false,
             outcome_edge: edge,
-        };
-        let attempts = [
-            attempt("build", Some(0)),
-            attempt("test", Some(1)),
-            attempt("clear-cache", Some(0)),
-            attempt("test", Some(0)),
-            attempt("deploy", Some(1)),
-            // rollback's transition is an end: no arrow.
-            attempt("rollback", Some(0)),
-        ];
-        let named: Vec<String> = taken(&layout, &attempts)
-            .into_iter()
-            .map(|i| {
+            epoch,
+        }
+    }
+
+    /// Edges taken, as "from→to ×count".
+    fn named(layout: &Layout, taken: &BTreeMap<usize, u32>) -> Vec<String> {
+        taken
+            .iter()
+            .map(|(&i, count)| {
                 let e = &layout.edges[i];
-                format!("{}→{}", layout.steps[e.from], layout.steps[e.to])
+                format!("{}→{} ×{count}", layout.steps[e.from], layout.steps[e.to])
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn the_path_taken_counts_each_closed_attempt_s_transition() {
+        let layout = layout(&ship_it());
+        let attempts = [
+            closed("build", Some(0), 0),
+            closed("test", Some(1), 0),
+            closed("clear-cache", Some(0), 0),
+            closed("test", Some(1), 0),
+            closed("clear-cache", Some(0), 0),
+            closed("test", Some(0), 0),
+            closed("deploy", Some(1), 0),
+            // rollback's transition is an end: no arrow.
+            closed("rollback", Some(0), 0),
+        ];
+        let mut named = named(&layout, &taken(&layout, &attempts));
+        named.sort();
         assert_eq!(
             named,
             [
-                "build→test",
-                "test→clear-cache",
-                "clear-cache→test",
-                "test→deploy",
-                "deploy→rollback"
+                "build→test ×1",
+                "clear-cache→test ×2",
+                "deploy→rollback ×1",
+                "test→clear-cache ×2",
+                "test→deploy ×1",
             ]
+        );
+    }
+
+    #[test]
+    fn a_retried_run_counts_only_its_current_pass() {
+        let mut graph = ship_it();
+        graph.steps.get_mut("test").unwrap().max_visits = Some(3);
+        let layout = layout(&graph);
+        // Pass 0 looped twice and was retried; pass 1 has looped once so far.
+        let attempts = [
+            closed("build", Some(0), 0),
+            closed("test", Some(1), 0),
+            closed("clear-cache", Some(0), 0),
+            closed("test", Some(1), 0),
+            closed("build", Some(0), 1),
+            closed("test", Some(1), 1),
+            closed("clear-cache", Some(0), 1),
+            closed("test", None, 1),
+        ];
+        let mut named = named(&layout, &taken(&layout, &attempts));
+        named.sort();
+        assert_eq!(
+            named,
+            [
+                "build→test ×1",
+                "clear-cache→test ×1",
+                "test→clear-cache ×1"
+            ]
+        );
+        let rows: Vec<PlanRow> = attempts
+            .iter()
+            .map(|attempt| PlanRow::Ran { attempt, via: None })
+            .collect();
+        let states = states(&rows, &graph, Timestamp::UNIX_EPOCH);
+        assert_eq!(
+            states["test"].visits(),
+            Some(Visits {
+                count: 2,
+                limit: Some(3)
+            })
+        );
+        assert_eq!(states["clear-cache"].visits().unwrap().count, 1);
+    }
+
+    #[test]
+    fn loop_arrows_turn_inside_the_drawing_even_at_its_edges() {
+        use Condition::{Failed, Succeeded};
+        // A loop out of the last column, back into the first.
+        let layout = layout(&graph(
+            "fetch",
+            &[
+                (
+                    "fetch",
+                    vec![(Failed, goto("backoff")), (Succeeded, goto("publish"))],
+                ),
+                ("backoff", vec![(Succeeded, goto("fetch"))]),
+                ("publish", vec![]),
+            ],
+        ));
+        let size = Geometry::natural(&layout);
+        let g = Geometry {
+            origin: Pos2::ZERO,
+            scale: 1.0,
+            grid_bottom: 0.0,
+        };
+        for (lane, edge) in layout.edges.iter().filter(|e| e.back).enumerate() {
+            let out = g.node(&layout, edge.from).right() + loop_reach(lane);
+            let back = g.node(&layout, edge.to).left() - loop_reach(lane);
+            assert!(
+                back > 0.0 && out < size.x,
+                "{back} .. {out} outside 0 .. {}",
+                size.x
+            );
+        }
+    }
+
+    #[test]
+    fn visits_read_against_their_limit_and_warn_past_half() {
+        let visits = |count, limit| Visits { count, limit };
+        assert_eq!(visits(1, None).text(), None);
+        assert_eq!(visits(3, None).text().as_deref(), Some("×3"));
+        assert_eq!(visits(1, Some(5)).text().as_deref(), Some("×1 of 5"));
+        assert!(!visits(9, None).near_limit(), "unbounded never warns");
+        assert!(!visits(2, Some(5)).near_limit());
+        assert!(visits(3, Some(5)).near_limit());
+        assert!(visits(2, Some(3)).near_limit());
+        assert!(visits(3, Some(3)).near_limit());
+        assert!(
+            !visits(1, Some(1)).near_limit(),
+            "a limit of one is no loop"
         );
     }
 }

@@ -113,6 +113,7 @@ fn attempt(step: &str, exit_code: Option<i32>, running: bool) -> LogAttempt {
         exit_code,
         timed_out: false,
         outcome_edge: None,
+        epoch: 0,
     }
 }
 

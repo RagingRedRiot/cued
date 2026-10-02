@@ -371,7 +371,7 @@ impl App {
         let mut picked = None;
         if let (true, Some(graph)) = (self.as_graph, &detail.graph) {
             let layout = flow::layout(graph);
-            let states = flow::states(&rows, now);
+            let states = flow::states(&rows, graph, now);
             let taken = flow::taken(&layout, &detail.attempts);
             egui::ScrollArea::both()
                 .id_salt("flow")
