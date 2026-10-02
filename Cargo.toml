@@ -46,4 +46,4 @@ members = [".", "crates/cued-gui"]
 
 # One version for both binaries: a release tag names them together.
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
