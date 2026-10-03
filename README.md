@@ -262,6 +262,13 @@ CI runs it with fmt, clippy and the test suite (`.github/workflows/ci.yml`).
 or existing tests, until a maintainer applies the `reviewed-controls` label to
 that revision.
 
+Releases are cut from the Actions tab, and pull requests never change the
+version. **Prepare release** bumps the workspace version to the next patch,
+minor, or major on a `release/vX.Y.Z` branch and links to a pull request for
+it. Merging that pull request makes **Publish release** tag the commit and
+start the release build (`.github/workflows/release.yml`), which attaches the
+archives to a GitHub release.
+
 The optional `test-hooks` feature enables fault injection for tests. Leave it off
 in installations used for real jobs.
 
