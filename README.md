@@ -185,6 +185,10 @@ redraw while nothing changes. It starts the daemon if none is running, from
 the `cued` beside it or on your `PATH` (`--no-auto-start` to leave it
 stopped).
 
+The window follows your desktop's light or dark appearance, read from the
+freedesktop settings portal, and switches when you change it. It exposes its
+controls to screen readers and other assistive technologies through AT-SPI.
+
 ## MCP
 
 Configure an AI client to launch `cued` with arguments `["mcp"]`. It serves

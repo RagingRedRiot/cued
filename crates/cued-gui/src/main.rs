@@ -53,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cued",
         options,
         Box::new(move |cc| {
+            cued_gui::appearance::follow(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let backend = Backend::start(paths, cued, auto_start, move || ctx.request_repaint());
             Ok(Box::new(App::new(backend)))

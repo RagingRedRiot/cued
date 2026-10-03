@@ -1,6 +1,7 @@
 //! A desktop status window for cued: what is running, waiting, and done,
 //! step by step, kept current by the daemon's change stream (DESIGN.md §5.1).
 pub mod app;
+pub mod appearance;
 pub mod backend;
 pub mod flow;
 pub mod model;
