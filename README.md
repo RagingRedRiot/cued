@@ -100,10 +100,7 @@ The window needs a Wayland or X11 desktop with OpenGL and glibc 2.35 or newer;
 install later, install the desktop archive over it: its `cued` is the same
 binary.
 
-While the repository is private, those URLs need GitHub access; fetch the same
-files with `gh release download --repo RagingRedRiot/cued --pattern 'cued-x86_64-*'`
-(headless) or `--pattern 'cued-desktop-*'` (desktop). Any directory on your
-`PATH` works in place of `~/.local/bin`.
+Any directory on your `PATH` works in place of `~/.local/bin`.
 
 ### Cargo
 
