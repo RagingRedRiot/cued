@@ -161,9 +161,10 @@ The [CLI guide](docs/cli.md) covers waiting, pausing, recovery, and exports;
 
 ## Status window
 
-<p align="center">
-  <img src="docs/assets/status-window.png" alt="The cued status window: jobs grouped into needs attention, up next, and recent on the left; on the right a failed workflow drawn as a graph, with a test step that looped through clear-cache twice, a deploy that failed into rollback, and a smoke-test step marked not reached" width="100%">
-</p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/status-window-dark.gif">
+  <img src="docs/assets/status-window-light.gif" alt="A release workflow is submitted from the terminal and the status window follows it live as a graph: its tests fail twice, looping through clear-cache, pass on the third visit at the step's limit, and the release deploys and passes its smoke test. Then a hotfix's deploy fails into a rollback, leaving the smoke test not reached" width="100%">
+</picture>
 
 `cued-gui` is a desktop window for your runs, like a CI status page for your
 machine. Jobs are grouped by what they need: held runs and approvals first,
