@@ -80,6 +80,17 @@ impl Fake {
     }
 }
 
+/// Waits `secs` without a tokio timer: zbus runs interface methods on the
+/// executor it was built for, which need not be tokio's.
+async fn stall(secs: u64) {
+    let (done, wait) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(secs));
+        let _ = done.send(());
+    });
+    let _ = wait.await;
+}
+
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl Fake {
     #[allow(clippy::too_many_arguments)]
@@ -96,7 +107,7 @@ impl Fake {
     ) -> zbus::fdo::Result<u32> {
         self.event(json!({"event": "received", "server": self.unique, "summary": summary}));
         if let Some(secs) = self.take("stall-before") {
-            tokio::time::sleep(Duration::from_secs(secs)).await;
+            stall(secs).await;
         }
         if self.take("fail").is_some() {
             self.event(json!({"event": "rejected", "server": self.unique, "summary": summary}));
@@ -115,7 +126,7 @@ impl Fake {
             "summary": summary, "body": body, "at": Timestamp::now().to_string(),
         }));
         if let Some(secs) = self.take("stall-after") {
-            tokio::time::sleep(Duration::from_secs(secs)).await;
+            stall(secs).await;
         }
         self.event(json!({"event": "acked", "server": self.unique, "id": id}));
         Ok(id)
