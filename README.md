@@ -6,9 +6,10 @@
 </p>
 
 <p align="center">
-  <b>Schedule commands, reminders, and workflows that survive restarts.</b><br>
-  A per-user scheduler for Linux, driven from your terminal or by an AI assistant over MCP,<br>
-  with an optional desktop window to watch your runs.
+  <b>Scheduled workflows, with the visibility of CI.</b><br>
+  A per-user scheduler for Linux. Schedule commands and reminders, define workflows in versionable TOML,<br>
+  and follow each step's output and outcome—with desktop notifications when a run needs your attention.<br>
+  Submit from your terminal or an AI assistant over MCP, with an optional desktop status window.
 </p>
 
 <p align="center">
@@ -21,6 +22,7 @@
 <p align="center">
   <a href="#install-and-upgrade"><b>Install</b></a> ·
   <a href="#quick-start"><b>Quick start</b></a> ·
+  <a href="#recipes"><b>Recipes</b></a> ·
   <a href="#status-window"><b>Status window</b></a> ·
   <a href="docs/cli.md"><b>CLI guide</b></a> ·
   <a href="docs/mcp.md"><b>MCP</b></a> ·
@@ -34,9 +36,9 @@
 - **Survives restarts.** Jobs and workflow positions live in SQLite. After a
   crash, reboot, or upgrade the daemon picks up where it left off, and a run
   that was interrupted is held for your review instead of blindly retried.
-- **Workflows, not just timers.** Run steps in order with `cued chain`, or
-  write a TOML workflow that branches on exit status, with durable waits
-  between steps.
+- **Reviewable workflows.** Chain commands from the terminal, or define steps,
+  conditions and routing in a TOML file you can version alongside your project.
+  Branch on results, wait between steps, and inspect the path each run took.
 - **Times the way you say them.** `"9am tomorrow"`, `"in 1h"`, `every "day 09:00"`,
   in any IANA time zone. Desktop reminders included.
 - **Built for AI assistants.** An MCP server with per-capability policy and
@@ -50,10 +52,33 @@
 - **Yours alone.** Runs per user, with no root. Other local users are refused
   by file permissions and by the daemon's kernel peer-credential check.
 
+## Why cued?
+
+Cron and systemd timers are excellent schedulers. When your scheduled work
+needs several steps, conditional routing, and a clear view of the results,
+cued brings those pieces together.
+
+**Define the workflow together.** A TOML file names the steps, their commands,
+and where each outcome leads. Review changes to the schedule and routing
+alongside the commands they control.
+
+**Watch what happened.** Each run records its steps, output, outcomes, and
+transitions. Inspect them from the terminal, or follow the execution path
+live in the optional desktop status window.
+
+**Choose when to be interrupted.** Add desktop notifications for success,
+failure, or a held run that needs review. Notifications are queued durably
+and delivery is retried when the desktop session is unavailable.
+
+You can build similar behavior with scripts and existing schedulers.
+cued provides a shared authoring, execution, and inspection model for it.
+
 > [!WARNING]
 > Early alpha: commands, storage, and protocols may change without compatibility
 > support. Interrupted commands can require human review; cued does not guarantee
 > exactly-once external effects.
+> Where practical, make commands safe to repeat (idempotent), and inspect interrupted
+> runs before retrying them.
 
 ## Install and upgrade
 
@@ -156,6 +181,57 @@ can be inspected, then resumed with `cued continue` or rerun with `cued retry`.
 The [CLI guide](docs/cli.md) covers waiting, pausing, recovery, and exports;
 `cued --help` has every option.
 
+## Recipes
+
+A recipe is a TOML workflow file: a schedule, commands, conditions, and routing.
+Keep it alongside your project so changes are versionable and reviewable.
+
+Here's an example of what a recipe looks like. It describes daily build and test
+checks for a project that already has `make build` and `make test` targets; those
+commands belong to the project, not cued.
+
+```toml
+name = "daily-build-and-test"
+every = "day 09:00"
+entry = "build"
+
+[on_failure]
+title = "Daily build or tests failed"
+body = "Check the run's step output in cued."
+
+[on_hold]
+title = "Daily checks need review"
+body = "Inspect the interrupted run before continuing or retrying."
+
+[[step]]
+id = "build"
+run = ["make", "build"]
+on.success = { goto = "test" }
+on.fail = { end = "failure" }
+
+[[step]]
+id = "test"
+run = ["make", "test"]
+on.success = { end = "success" }
+on.fail = { end = "failure" }
+```
+
+To use a recipe like this, adapt the commands to your project, save the TOML as
+`daily-checks.toml`, and explicitly submit it from your project directory:
+
+```sh
+cued submit daily-checks.toml
+```
+
+The schedule uses your local time zone. Submission captures the working
+directory and environment; desktop notifications require a desktop session.
+
+The [`recipes/`](recipes/) directory contains examples to read, copy, and adapt.
+cued does not scan that directory or submit its files automatically. To contribute
+a recipe, write the TOML outside cued and verify its behavior in cued before
+opening a pull request; we do not recommend using a job export as the starting
+point. See the [recipe contribution guidance](recipes/README.md).
+
 ## Status window
 
 <picture>
@@ -234,6 +310,14 @@ window's launcher entry if you installed one. Your config files are kept
 unless you pass `--purge`. The binaries are yours to remove, as above. Off
 a terminal, `--yes` is required. To keep a job, export it first with
 `cued show ID --toml`.
+
+## Contributing
+
+Bug reports, focused patches, verified recipes, and documentation improvements
+are welcome, including AI-assisted contributions. Read the
+[contribution guide](CONTRIBUTING.md) for development checks, submission guidance,
+and review expectations. For suspected vulnerabilities, follow the
+[security policy](SECURITY.md) and report privately.
 
 ## Development
 

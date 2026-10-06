@@ -1,0 +1,23 @@
+name = "daily-build-and-test"
+every = "day 09:00"
+entry = "build"
+
+[on_failure]
+title = "Daily build or tests failed"
+body = "Check the run's step output in cued."
+
+[on_hold]
+title = "Daily checks need review"
+body = "Inspect the interrupted run before continuing or retrying."
+
+[[step]]
+id = "build"
+run = ["make", "build"]
+on.success = { goto = "test" }
+on.fail = { end = "failure" }
+
+[[step]]
+id = "test"
+run = ["make", "test"]
+on.success = { end = "success" }
+on.fail = { end = "failure" }
